@@ -1,0 +1,102 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file aclnn_chunk_fwd_o.cpp
+ * \brief Two-stage aclnn entry for ChunkFwdO.
+ */
+
+#include "aclnn_chunk_fwd_o.h"
+#include "chunk_fwd_o.h"
+#include "aclnn_kernels/common/op_error_check.h"
+#include "aclnn_kernels/contiguous.h"
+#include "opdev/common_types.h"
+#include "opdev/op_dfx.h"
+#include "opdev/op_executor.h"
+#include "opdev/op_log.h"
+
+using namespace op;
+
+namespace {
+
+static const std::initializer_list<op::DataType> QKV_DT  = {op::DataType::DT_BF16, op::DataType::DT_FLOAT16};
+static const std::initializer_list<op::DataType> G_DT    = {op::DataType::DT_FLOAT};
+static const std::initializer_list<op::DataType> SEQ_DT  = {op::DataType::DT_INT64};
+
+static bool CheckParams(const aclTensor* q, const aclTensor* k, const aclTensor* v,
+                        const aclTensor* h, const aclTensor* g,
+                        const aclTensor* cuSeqlens, const aclTensor* chunkOffsets,
+                        const aclTensor* o)
+{
+    OP_CHECK_NULL(q, return false);
+    OP_CHECK_NULL(k, return false);
+    OP_CHECK_NULL(v, return false);
+    OP_CHECK_NULL(h, return false);
+    OP_CHECK_NULL(cuSeqlens, return false);
+    OP_CHECK_NULL(chunkOffsets, return false);
+    OP_CHECK_NULL(o, return false);
+
+    OP_CHECK_DTYPE_NOT_SUPPORT(q, QKV_DT, return false);
+    OP_CHECK_DTYPE_NOT_SUPPORT(k, QKV_DT, return false);
+    OP_CHECK_DTYPE_NOT_SUPPORT(v, QKV_DT, return false);
+    OP_CHECK_DTYPE_NOT_SUPPORT(h, QKV_DT, return false);
+    OP_CHECK_DTYPE_NOT_SUPPORT(o, QKV_DT, return false);
+    OP_CHECK_DTYPE_NOT_SUPPORT(cuSeqlens, SEQ_DT, return false);
+    OP_CHECK_DTYPE_NOT_SUPPORT(chunkOffsets, SEQ_DT, return false);
+    if (g != nullptr) {
+        OP_CHECK_DTYPE_NOT_SUPPORT(g, G_DT, return false);
+    }
+    return true;
+}
+
+}  // namespace
+
+aclnnStatus aclnnChunkFwdOGetWorkspaceSize(const aclTensor* q, const aclTensor* k, const aclTensor* v,
+                                           const aclTensor* h, const aclTensor* g,
+                                           const aclTensor* cuSeqlens, const aclTensor* chunkOffsets,
+                                           float scale, int64_t chunkSize,
+                                           aclTensor* o, uint64_t* workspaceSize, aclOpExecutor** executor)
+{
+    L2_DFX_PHASE_1(aclnnChunkFwdO,
+                   DFX_IN(q, k, v, h, g, cuSeqlens, chunkOffsets, scale, chunkSize),
+                   DFX_OUT(o));
+
+    auto uniqueExecutor = CREATE_EXECUTOR();
+    CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
+
+    CHECK_RET(CheckParams(q, k, v, h, g, cuSeqlens, chunkOffsets, o), ACLNN_ERR_PARAM_INVALID);
+
+    auto qC  = l0op::Contiguous(q,  uniqueExecutor.get());
+    auto kC  = l0op::Contiguous(k,  uniqueExecutor.get());
+    auto vC  = l0op::Contiguous(v,  uniqueExecutor.get());
+    auto hC  = l0op::Contiguous(h,  uniqueExecutor.get());
+    auto cuC = l0op::Contiguous(cuSeqlens, uniqueExecutor.get());
+    auto coC = l0op::Contiguous(chunkOffsets, uniqueExecutor.get());
+    const aclTensor* gC = nullptr;
+    if (g != nullptr) {
+        gC = l0op::Contiguous(g, uniqueExecutor.get());
+    }
+
+    auto outRet = l0op::ChunkFwdO(qC, kC, vC, hC, gC, cuC, coC, scale, chunkSize, uniqueExecutor.get());
+    CHECK_RET(outRet != nullptr, ACLNN_ERR_INNER_NULLPTR);
+
+    auto out_ = l0op::Contiguous(o, uniqueExecutor.get());
+    auto viewCopyResult = l0op::ViewCopy(outRet, out_, uniqueExecutor.get());
+    CHECK_RET(viewCopyResult != nullptr, ACLNN_ERR_INNER_NULLPTR);
+
+    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    uniqueExecutor.ReleaseTo(executor);
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus aclnnChunkFwdO(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream)
+{
+    L2_DFX_PHASE_2(aclnnChunkFwdO);
+    return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
