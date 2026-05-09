@@ -9,8 +9,7 @@
 
 /*!
  * \file chunk_fwd_o_infershape.cpp
- * \brief shape and dtype inference for ChunkFwdO. Output o has the same
- *        shape/dtype as v.
+ * \brief ChunkFwdO 的 shape/dtype 推导：输出 o 与输入 v 形状/dtype 完全一致。
  */
 
 #include "exe_graph/runtime/infer_shape_context.h"

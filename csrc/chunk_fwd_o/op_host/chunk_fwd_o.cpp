@@ -9,7 +9,8 @@
 
 /*!
  * \file chunk_fwd_o.cpp
- * \brief L0 op (graph construction helper) for ChunkFwdO.
+ * \brief ChunkFwdO 的 L0 op 实现：负责分配输出 tensor、调用 InferShape 并把
+ *        算子加入 AICore 执行队列。
  */
 
 #include "chunk_fwd_o.h"

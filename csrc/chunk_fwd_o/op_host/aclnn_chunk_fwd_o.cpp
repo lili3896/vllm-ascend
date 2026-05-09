@@ -9,7 +9,7 @@
 
 /*!
  * \file aclnn_chunk_fwd_o.cpp
- * \brief Two-stage aclnn entry for ChunkFwdO.
+ * \brief ChunkFwdO 的两段式 aclnn 入口实现：参数检查 + 输入连续化 + 调用 L0。
  */
 
 #include "aclnn_chunk_fwd_o.h"
@@ -25,10 +25,12 @@ using namespace op;
 
 namespace {
 
+// 各输入支持的数据类型清单。
 static const std::initializer_list<op::DataType> QKV_DT  = {op::DataType::DT_BF16, op::DataType::DT_FLOAT16};
 static const std::initializer_list<op::DataType> G_DT    = {op::DataType::DT_FLOAT};
 static const std::initializer_list<op::DataType> SEQ_DT  = {op::DataType::DT_INT64};
 
+// 入参合法性校验：必选 tensor 非空、各 tensor dtype 在支持范围内。
 static bool CheckParams(const aclTensor* q, const aclTensor* k, const aclTensor* v,
                         const aclTensor* h, const aclTensor* g,
                         const aclTensor* cuSeqlens, const aclTensor* chunkOffsets,
@@ -72,6 +74,7 @@ aclnnStatus aclnnChunkFwdOGetWorkspaceSize(const aclTensor* q, const aclTensor* 
 
     CHECK_RET(CheckParams(q, k, v, h, g, cuSeqlens, chunkOffsets, o), ACLNN_ERR_PARAM_INVALID);
 
+    // 把所有输入转成连续布局，避免 kernel 内部需要处理 stride。
     auto qC  = l0op::Contiguous(q,  uniqueExecutor.get());
     auto kC  = l0op::Contiguous(k,  uniqueExecutor.get());
     auto vC  = l0op::Contiguous(v,  uniqueExecutor.get());
@@ -83,6 +86,7 @@ aclnnStatus aclnnChunkFwdOGetWorkspaceSize(const aclTensor* q, const aclTensor* 
         gC = l0op::Contiguous(g, uniqueExecutor.get());
     }
 
+    // 调用 L0 接口，加入 launcher。
     auto outRet = l0op::ChunkFwdO(qC, kC, vC, hC, gC, cuC, coC, scale, chunkSize, uniqueExecutor.get());
     CHECK_RET(outRet != nullptr, ACLNN_ERR_INNER_NULLPTR);
 

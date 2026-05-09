@@ -9,7 +9,8 @@
 
 /*!
  * \file chunk_fwd_o.cpp
- * \brief AscendC kernel entry point of ChunkFwdO. KERNEL_TYPE_MIX_AIC_1_2.
+ * \brief ChunkFwdO 算子的 AscendC kernel 入口，使用 KERNEL_TYPE_MIX_AIC_1_2
+ *        的 1 AIC + 2 AIV 混合执行模式。
  */
 
 #include "kernel_operator.h"
@@ -33,6 +34,7 @@ __aicore__ inline void ChunkFwdODispatch(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADD
 
     int64_t blockId = static_cast<int64_t>(GetBlockIdx());
     int64_t numCubeCores = td->numCubeCore;
+    // 任务区间在 AIC 核间均匀划分，AIV 与配对 AIC 共享同一区间。
     int64_t taskBegin = (totalTasks * blockId) / numCubeCores;
     int64_t taskEnd   = (totalTasks * (blockId + 1)) / numCubeCores;
     if (taskBegin >= taskEnd) {

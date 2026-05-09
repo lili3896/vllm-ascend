@@ -9,7 +9,7 @@
 
 /*!
  * \file chunk_fwd_o_tiling.h
- * \brief Host-side tiling for ChunkFwdO.
+ * \brief ChunkFwdO 算子的 host 端 tiling 类声明。
  */
 
 #ifndef __OP_HOST_CHUNK_FWD_O_TILING_H__
@@ -50,6 +50,7 @@ END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ChunkFwdO, ChunkFwdOTilingData)
 
+// 编译期从平台信息中拿到的常量，host tiling 计算时会用到。
 struct ChunkFwdOCompileInfo {
     uint64_t aicNum {0};
     uint64_t aivNum {0};

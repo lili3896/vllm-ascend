@@ -1,17 +1,14 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-# This file is a part of the vllm-ascend project.
+# 本文件是 vllm-ascend 项目的一部分。
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-"""Unit tests for the AscendC implementation of FLA chunk_fwd_o.
+# 在 Apache License 2.0 协议下发布。
+"""FLA ChunkFwdO 算子 AscendC 实现的单元测试。
 
-When the custom AscendC op (`torch.ops._C_ascend.npu_chunk_fwd_o`) is not
-available the dispatcher must transparently fall back to the Triton kernel.
-This is the only behaviour we can verify in CI environments without an NPU
-runtime, so most tests are dispatcher-shape tests.
+当 AscendC 自定义算子（``torch.ops._C_ascend.npu_chunk_fwd_o``）不可用时，
+分发器必须能够无感地回落到 triton kernel。这是 CI 环境（无 NPU 运行时）
+中唯一可以被验证的行为，因此大部分用例只测试 Python 分发器逻辑。
 
-A numerical comparison test is included but skipped automatically when no
-NPU device is visible / the custom op is not registered.
+数值对比用例需要 NPU 设备且自定义算子已注册，否则会自动跳过。
 """
 from __future__ import annotations
 
@@ -33,10 +30,10 @@ def _has_ascendc_op() -> bool:
 
 
 class TestChunkFwdODispatcher(unittest.TestCase):
-    """Exercises the python-level dispatcher logic without launching a kernel."""
+    """验证 Python 分发器的回落与开关行为，无需启动 device kernel。"""
 
     def test_dispatcher_falls_back_when_op_missing(self):
-        """When the custom op is unavailable the dispatcher must call triton."""
+        """当 AscendC 算子不可用时，分发器必须调用 triton 实现。"""
         from vllm_ascend.ops.triton.fla import chunk_o_ascendc as mod
 
         with mock.patch.object(mod, "_ascendc_chunk_fwd_o_available",
@@ -52,6 +49,7 @@ class TestChunkFwdODispatcher(unittest.TestCase):
             self.assertIs(out, triton_fn.return_value)
 
     def test_unsupported_chunk_size_falls_back(self):
+        """非 64 的 chunk_size 必须走 triton 路径。"""
         from vllm_ascend.ops.triton.fla import chunk_o_ascendc as mod
         with mock.patch.object(mod, "_ascendc_chunk_fwd_o_available",
                                return_value=True), \
@@ -65,18 +63,19 @@ class TestChunkFwdODispatcher(unittest.TestCase):
             triton_fn.assert_called_once()
 
     def test_env_disable_forces_fallback(self):
+        """环境变量 VLLM_ASCEND_DISABLE_CHUNK_FWD_O_ASCENDC=1 应强制使用 triton。"""
         from vllm_ascend.ops.triton.fla import chunk_o_ascendc as mod
         with mock.patch.dict(os.environ,
                              {"VLLM_ASCEND_DISABLE_CHUNK_FWD_O_ASCENDC": "1"}):
-            mod._ASCENDC_OP_AVAILABLE = None  # force re-evaluation
+            mod._ASCENDC_OP_AVAILABLE = None  # 强制重新评估
             self.assertFalse(mod._ascendc_chunk_fwd_o_available())
-        mod._ASCENDC_OP_AVAILABLE = None  # reset for other tests
+        mod._ASCENDC_OP_AVAILABLE = None  # 复位以免影响其它用例
 
 
 @pytest.mark.skipif(not (_has_npu() and _has_ascendc_op()),
-                    reason="ChunkFwdO AscendC op or NPU not available")
+                    reason="ChunkFwdO AscendC 算子或 NPU 设备不可用")
 class TestChunkFwdONumerical(unittest.TestCase):
-    """Numerical comparison vs. the Triton reference. Run only on NPU."""
+    """与 triton 参考实现的数值对比，仅在 NPU 上执行。"""
 
     def _run_one(self, B, T, H, K, V, dtype, varlen=False):
         from vllm_ascend.ops.triton.fla.chunk_o import \

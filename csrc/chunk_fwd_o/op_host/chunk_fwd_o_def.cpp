@@ -9,7 +9,7 @@
 
 /*!
  * \file chunk_fwd_o_def.cpp
- * \brief OpDef registration for ChunkFwdO.
+ * \brief ChunkFwdO 算子的 OpDef 注册：声明输入/输出/属性以及 AICore 配置。
  */
 
 #include "register/op_def_registry.h"
@@ -20,7 +20,7 @@ class ChunkFwdO : public OpDef {
 public:
     explicit ChunkFwdO(const char* name) : OpDef(name)
     {
-        // Inputs
+        // 输入张量声明
         this->Input("q")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
@@ -70,15 +70,18 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
 
+        // 输出张量声明
         this->Output("o")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
 
+        // 属性声明：scale 与 chunk_size
         this->Attr("scale").AttrType(REQUIRED).Float(1.0);
         this->Attr("chunk_size").AttrType(REQUIRED).Int(64);
 
+        // AICore 配置：使用 MIX 核类型，启用动态 shape/dynamic format 支持
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

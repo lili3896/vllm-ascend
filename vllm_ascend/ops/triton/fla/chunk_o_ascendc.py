@@ -1,22 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""AscendC implementation of the Flash-Linear-Attention chunk forward output.
+"""Flash-Linear-Attention chunk 前向输出的 AscendC 实现入口。
 
-This module exposes :func:`chunk_fwd_o_ascendc`, which is functionally
-equivalent to the Triton kernel in :mod:`vllm_ascend.ops.triton.fla.chunk_o`
-but executes a custom AscendC kernel (``npu_chunk_fwd_o``) registered through
-``torch.ops._C_ascend``.  The custom kernel is significantly faster on
-Ascend NPUs because it dispatches the three matmuls onto the AIC (cube) cores
-while the AIV (vector) cores fuse exp(g), causal masking, scaling and the cast
-in a 1 AIC + 2 AIV mixed pipeline.
+本模块对外暴露 :func:`chunk_fwd_o_ascendc`，其语义与
+:mod:`vllm_ascend.ops.triton.fla.chunk_o` 中的 triton kernel 完全等价，
+但底层会优先调用通过 ``torch.ops._C_ascend`` 注册的 AscendC 自定义算子
+``npu_chunk_fwd_o``。该自定义算子在 Ascend NPU 上比 triton 版本显著更快，
+原因是它把三个 GEMM 下放到 AIC（Cube）核，并在 1 AIC + 2 AIV 的混合流水中
+让 AIV（Vector）核同时完成 exp(g)、causal mask、缩放和回写 cast 等向量计算。
 
-The Python entry point falls back automatically to the Triton implementation
-when:
+在以下情况下，本入口会自动回落到 triton 实现：
 
-* ``vllm_ascend`` is built without custom ops, or
-* ``npu_chunk_fwd_o`` is not present in ``torch.ops._C_ascend``, or
-* the input shape is unsupported by the AscendC kernel (currently we require
-  ``K`` and ``V`` to be a multiple of 16 and ``chunk_size`` to be 64).
+* vllm-ascend 构建未启用自定义算子；
+* ``npu_chunk_fwd_o`` 未在 ``torch.ops._C_ascend`` 中注册；
+* 当前输入 shape 不在 AscendC kernel 的支持范围内（当前要求 ``K``、``V``
+  对齐到 16，并且 ``chunk_size == 64``）。
 """
 from __future__ import annotations
 
@@ -32,9 +30,11 @@ _ASCENDC_OP_AVAILABLE: bool | None = None
 
 
 def _ascendc_chunk_fwd_o_available() -> bool:
+    """判断 AscendC 自定义算子在当前进程中是否可用。结果会被缓存。"""
     global _ASCENDC_OP_AVAILABLE
     if _ASCENDC_OP_AVAILABLE is not None:
         return _ASCENDC_OP_AVAILABLE
+    # 通过环境变量可强制关闭 AscendC 路径，便于 A/B 对比与故障排查。
     if os.environ.get("VLLM_ASCEND_DISABLE_CHUNK_FWD_O_ASCENDC", "0") == "1":
         _ASCENDC_OP_AVAILABLE = False
         return False
@@ -53,6 +53,7 @@ def _ascendc_chunk_fwd_o_available() -> bool:
 
 
 def _supports_shape(q: torch.Tensor, v: torch.Tensor, chunk_size: int) -> bool:
+    """判断当前 (q, v, chunk_size) 是否落在 AscendC kernel 支持范围内。"""
     if chunk_size != 64:
         return False
     K = q.shape[-1]
@@ -66,9 +67,9 @@ def _supports_shape(q: torch.Tensor, v: torch.Tensor, chunk_size: int) -> bool:
 
 def _maybe_build_cu_seqlens(q: torch.Tensor,
                             cu_seqlens: torch.Tensor | None) -> torch.Tensor:
+    """非 varlen 模式下根据 q 的形状合成 cu_seqlens=[0, T, 2T, ..., B*T]。"""
     if cu_seqlens is not None:
         return cu_seqlens.to(torch.int64)
-    # Fixed-shape mode: synthesize cu_seqlens = [0, T, 2T, ..., B*T].
     B, T = q.shape[0], q.shape[1]
     return torch.arange(0, (B + 1) * T, T,
                         device=q.device, dtype=torch.int64)
@@ -85,10 +86,11 @@ def chunk_fwd_o_ascendc(
     chunk_size: int = 64,
     chunk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute FLA chunk-wise output ``o`` using the AscendC custom op when
-    available, otherwise fall back to the Triton implementation.
+    """计算 FLA chunk 前向输出 ``o``。
 
-    Signature matches :func:`vllm_ascend.ops.triton.fla.chunk_o.chunk_fwd_o`.
+    优先调用 AscendC 自定义算子；不可用或 shape 不支持时自动回落到 triton
+    实现，因此函数签名与 :func:`vllm_ascend.ops.triton.fla.chunk_o.chunk_fwd_o`
+    完全保持一致。
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -104,8 +106,8 @@ def chunk_fwd_o_ascendc(
         chunk_offsets = prepare_chunk_offsets(cu_seqlens_t, chunk_size)
     chunk_offsets_t = chunk_offsets.to(torch.int64)
 
-    # The AscendC kernel expects g in (T, H) layout already (matching the
-    # triton kernel's transpose).  Mirror the conversion done there.
+    # AscendC kernel 期望 g 已经是 (T, H) 的布局（与 triton 实现转置后的
+    # 输入保持一致），因此在此处完成同样的转置。
     g_in: torch.Tensor | None = None
     if g is not None:
         g_in = g.transpose(-2, -1).contiguous()

@@ -9,7 +9,8 @@
 
 /*!
  * \file chunk_fwd_o_tiling.cpp
- * \brief Host-side tiling for ChunkFwdO.
+ * \brief ChunkFwdO 算子的 host 端 tiling 实现：解析输入 shape/dtype/属性，
+ *        进行核间任务划分以及 workspace 规划。
  */
 
 #include "register/op_def_registry.h"
@@ -105,7 +106,7 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
     const auto& cS = cuShape->GetOriginShape();
 
     int64_t numTokens, Hg, K, H, V;
-    if (qS.GetDimNum() == 4) {  // (B, T, Hg, K) fixed-shape mode
+    if (qS.GetDimNum() == 4) {  // (B, T, Hg, K) 固定 shape 模式
         int64_t B = qS.GetDim(0);
         int64_t T = qS.GetDim(1);
         Hg = qS.GetDim(2);
@@ -116,7 +117,7 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
         tilingData_.set_isVariedLen(0);
         tilingData_.set_seqlen(T);
         tilingData_.set_shapeBatch(B);
-    } else if (qS.GetDimNum() == 3) {  // (Ttotal, Hg, K) varlen mode
+    } else if (qS.GetDimNum() == 3) {  // (Ttotal, Hg, K) varlen 模式
         numTokens = qS.GetDim(0);
         Hg = qS.GetDim(1);
         K  = qS.GetDim(2);
@@ -124,7 +125,7 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
         V  = vS.GetDim(2);
         int64_t N = cS.GetDim(0) - 1;
         tilingData_.set_isVariedLen(1);
-        tilingData_.set_seqlen(numTokens);  // upper bound
+        tilingData_.set_seqlen(numTokens);  // 取上界
         tilingData_.set_shapeBatch(N);
     } else {
         OP_LOGE(inputParams_.opName, "q must be 3D or 4D, got rank %zu", qS.GetDimNum());
@@ -136,7 +137,7 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
     tilingData_.set_kHeadDim(K);
     tilingData_.set_vHeadDim(V);
     tilingData_.set_tokenBatch(numTokens);
-    tilingData_.set_totalChunks(hS.GetDim(0));  // h is (totalChunks, H, K, V)
+    tilingData_.set_totalChunks(hS.GetDim(0));  // h 形状为 (totalChunks, H, K, V)
 
     tilingData_.set_hasG(context_->GetOptionalInputDesc(G_INDEX) != nullptr ? 1 : 0);
     return ge::GRAPH_SUCCESS;
@@ -161,16 +162,16 @@ ge::graphStatus ChunkFwdOTiling::PlanWorkspaces()
     int64_t dtSize = tilingData_.get_dataType() == 0 ? 2 : 2;  // bf16/fp16
     int64_t numCubeCore = static_cast<int64_t>(compileInfo_.aicNum > 0 ? compileInfo_.aicNum : 1);
 
+    // 各类 workspace 在 GM 上的单核大小，512 字节对齐以匹配 L2 burst。
     int64_t hwsBytesPerCore   = CeilAlignT<int64_t>(BT * BV * sizeof(float), WORKSPACE_ALIGN);
     int64_t attnBytesPerCore  = CeilAlignT<int64_t>(BT * BT * sizeof(float), WORKSPACE_ALIGN);
     int64_t vwsBytesPerCore   = hwsBytesPerCore;
     int64_t amBytesPerCore    = CeilAlignT<int64_t>(BT * BT * dtSize, WORKSPACE_ALIGN);
     int64_t maskBytesPerCore  = CeilAlignT<int64_t>(BT * BT * sizeof(float), WORKSPACE_ALIGN);
 
-    // Each AIC has private workspace slots; offsets in the kernel are absolute
-    // (per-block) so we only need a single chunk's worth here when the AIC and
-    // its paired AIVs cooperate on the same tile.  For 1-AIC-2-AIV mix layout,
-    // all three workspaces are sized per-AIC.
+    // 每个 AIC 拥有独立的 workspace 槽位。在 1 AIC + 2 AIV 混合布局下，
+    // 同一 AIC 与配对 AIV 共用同一份 workspace，因此只需为每个 AIC
+    // 预留一份缓冲。
     tilingData_.set_hWorkspaceOffset(0);
     tilingData_.set_attnWorkspaceOffset(hwsBytesPerCore * numCubeCore);
     tilingData_.set_vWorkspaceOffset(tilingData_.get_attnWorkspaceOffset() + attnBytesPerCore * numCubeCore);
@@ -193,6 +194,7 @@ ge::graphStatus ChunkFwdOTiling::PlanCorePartition()
     int64_t aicNum = static_cast<int64_t>(compileInfo_.aicNum > 0 ? compileInfo_.aicNum : 1);
     int64_t aivNum = static_cast<int64_t>(compileInfo_.aivNum > 0 ? compileInfo_.aivNum : aicNum * 2);
 
+    // 当任务量小于核数时，按需收缩，避免空跑核。
     int64_t usedAic = std::min<int64_t>(totalTasks, aicNum);
     int64_t usedAiv = usedAic * (aivNum / std::max<int64_t>(aicNum, 1));
 

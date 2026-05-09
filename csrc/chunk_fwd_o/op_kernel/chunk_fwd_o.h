@@ -9,21 +9,22 @@
 
 /*!
  * \file chunk_fwd_o.h
- * \brief AIC + AIV mixed AscendC kernel implementation of ChunkFwdO.
+ * \brief ChunkFwdO 算子在 Ascend NPU 上的 AIC + AIV 混合 AscendC 实现。
  *
- *  Computes the chunk-wise forward output of FLA:
+ *  本算子计算 FLA（Flash-Linear-Attention）前向输出的 chunk 切分公式：
  *
  *      o = (Q @ H) * exp(g) * scale + (causal_mask(Q @ K) * exp(g_i - g_j)) @ V * scale
  *
- *  Three matmuls run on the AIC (cube) cores via AscendC's high-level Matmul
- *  API, while the AIV (vector) cores fuse exp(g), causal masking, scaling and
- *  the cast back to fp16/bf16.  Cores synchronise via cross-core flags and
- *  share three GM "workspace" buffers per AIC.
+ *  三个 GEMM（Q@H、Q@K^T、A_masked@V）下放到 AIC（Cube）核上、调用 AscendC
+ *  的高阶 Matmul API 完成；exp(g)、因果 mask、乘 scale 以及向 fp16/bf16 的
+ *  cast 等向量计算交由 AIV（Vector）核完成。两类核之间通过 CrossCoreSetFlag /
+ *  WaitFlag 同步，并共享若干位于 GM 上的 workspace 缓冲区。
  *
- *  Block partition (matches the triton kernel layout):
- *      total_tasks = ceil(V/BV) * sum_n(H * 1)  // one program per (i_v, n*H + h)
- *      tasks are split evenly across the AIC cores; for each AIC, a pair of
- *      AIV cores cooperate on alternating chunks (KERNEL_TYPE_MIX_AIC_1_2).
+ *  分核策略（与 triton kernel 完全一致）：
+ *      total_tasks = ceil(V/BV) * sum_n(H * 1)
+ *      // 每个 program 对应一个 (i_v, n*H + h) 任务
+ *      // 任务在 AIC 核间均匀划分；每个 AIC 配两个 AIV，按 chunk 串行流水
+ *      // 协作处理（KERNEL_TYPE_MIX_AIC_1_2）。
  */
 
 #ifndef __CHUNK_FWD_O_KERNEL_H__
@@ -40,19 +41,19 @@ using namespace AscendC;
 using namespace matmul;
 
 // ---------------------------------------------------------------------------
-// Constants and helpers
+// 常量与辅助函数
 // ---------------------------------------------------------------------------
 constexpr uint32_t BLOCK_BYTES        = 32;
-constexpr uint32_t BT                 = CHUNK_FWD_O_BT;       // 64
-constexpr uint32_t BV_MAX             = CHUNK_FWD_O_BV;       // 128
-constexpr uint32_t BK_MAX             = CHUNK_FWD_O_BK;       // 128
+constexpr uint32_t BT                 = CHUNK_FWD_O_BT;       // chunk 大小，默认 64
+constexpr uint32_t BV_MAX             = CHUNK_FWD_O_BV;       // V 方向块大小，默认 128
+constexpr uint32_t BK_MAX             = CHUNK_FWD_O_BK;       // K 方向块大小，默认 128
 
-// Cross-core synchronisation tags between the AIC pipeline and AIV pipeline.
-constexpr uint32_t SYNC_AIC_TO_AIV_QH    = 0;   // AIC produced Q@H
-constexpr uint32_t SYNC_AIC_TO_AIV_QK    = 1;   // AIC produced Q@K
-constexpr uint32_t SYNC_AIV_TO_AIC_AV    = 2;   // AIV produced masked A
-constexpr uint32_t SYNC_AIC_TO_AIV_AV    = 3;   // AIC produced A@V
-constexpr uint32_t SYNC_AIV_TO_AIC_NEXT  = 4;   // AIV released previous chunk
+// AIC 与 AIV 之间的同步标记。
+constexpr uint32_t SYNC_AIC_TO_AIV_QH    = 0;   // AIC 完成 Q@H
+constexpr uint32_t SYNC_AIC_TO_AIV_QK    = 1;   // AIC 完成 Q@K
+constexpr uint32_t SYNC_AIV_TO_AIC_AV    = 2;   // AIV 完成 mask，AIC 可执行 A@V
+constexpr uint32_t SYNC_AIC_TO_AIV_AV    = 3;   // AIC 完成 A@V
+constexpr uint32_t SYNC_AIV_TO_AIC_NEXT  = 4;   // AIV 释放上一 chunk 的 workspace
 
 template <typename T>
 __aicore__ inline T CeilDiv(T a, T b)
@@ -67,7 +68,7 @@ __aicore__ inline T AlignUp(T a, T align)
 }
 
 // ---------------------------------------------------------------------------
-// AIC service (cube): three matmuls per chunk.
+// AIC（Cube）服务：每个 chunk 完成三次 Matmul。
 // ---------------------------------------------------------------------------
 template <typename Q_T>
 class ChunkFwdOAIC {
@@ -80,7 +81,7 @@ public:
     using QH_BIAS_T  = MatmulType<TPosition::GM, CubeFormat::ND, L0_T>;
 
     using QK_AT_TYPE = MatmulType<TPosition::GM, CubeFormat::ND, Q_T, false>;
-    using QK_BT_TYPE = MatmulType<TPosition::GM, CubeFormat::ND, Q_T, true>;  // K is "transposed": (K, T)
+    using QK_BT_TYPE = MatmulType<TPosition::GM, CubeFormat::ND, Q_T, true>;  // K 转置：(K, T)
     using QK_CT_TYPE = MatmulType<TPosition::GM, CubeFormat::ND, L0_T>;
     using QK_BIAS_T  = MatmulType<TPosition::GM, CubeFormat::ND, L0_T>;
 
@@ -133,7 +134,7 @@ public:
                            Tcur, K, V, H, Hg, BV);
             }
         }
-        // Final flush: ensure AIV consumer drained the last AV result.
+        // 收尾：等待 AIV 把最后一个 chunk 的 AV 结果消费完毕。
         CrossCoreWaitFlag(SYNC_AIV_TO_AIC_NEXT);
     }
 
@@ -174,7 +175,7 @@ private:
         mmQK.IterateAll(reinterpret_cast<__gm__ L0_T*>(attnAddr), false);
         CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV_QK);
 
-        // ---- 3) Wait for AIV to write masked A in Q_T into aftermaskWorkspace ----
+        // ---- 3) 等待 AIV 把 mask 后的 A 写入 aftermaskWorkspace ----
         CrossCoreWaitFlag(SYNC_AIV_TO_AIC_AV);
 
         // ---- 4) A_masked @ V -> vWorkspace (BT x BV, fp32) ----
@@ -195,7 +196,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// AIV service (vector): scale Q in-place, gate, mask, fuse partials, cast.
+// AIV（Vector）服务：完成 Q 缩放、gate、causal mask、partial 累加与输出 cast。
 // ---------------------------------------------------------------------------
 template <typename Q_T>
 class ChunkFwdOAIV {
@@ -290,7 +291,7 @@ private:
         const uint32_t totalQH   = btAlign * bvAlign;
         const uint32_t totalAttn = btAlign * btAlign;
 
-        // ---- (a) Wait Q@H, load to UB ----
+        // ---- (a) 等待 Q@H 并加载到 UB ----
         CrossCoreWaitFlag(SYNC_AIC_TO_AIV_QH);
         LocalTensor<float> qh = qhQue_.AllocTensor<float>();
         GlobalTensor<float> hwsGm;
@@ -299,7 +300,7 @@ private:
         qhQue_.EnQue(qh);
         qh = qhQue_.DeQue<float>();
 
-        // ---- (b) Wait Q@K, load attn ----
+        // ---- (b) 等待 Q@K，加载 attn ----
         CrossCoreWaitFlag(SYNC_AIC_TO_AIV_QK);
         LocalTensor<float> attn = attnQue_.AllocTensor<float>();
         GlobalTensor<float> attnGm;
@@ -308,7 +309,7 @@ private:
         attnQue_.EnQue(attn);
         attn = attnQue_.DeQue<float>();
 
-        // ---- (c) Optional gate g ----
+        // ---- (c) 可选 gate g 处理 ----
         if (useG) {
             LocalTensor<float> gVec = gQue_.AllocTensor<float>();
             GlobalTensor<float> gGm;
@@ -318,12 +319,12 @@ private:
             gQue_.EnQue(gVec);
             gVec = gQue_.DeQue<float>();
 
-            // Vectorised exp(g): produces gExp[i] = exp(g[i]).
+            // 向量化 exp(g)：gExp[i] = exp(g[i])
             Exp(gVec, gVec, btAlign);
             PipeBarrier<PIPE_V>();
 
-            // qh_row[i] *= gExp[i]    (row-wise scaling on actBV elements)
-            // attn[i,j] *= (i>=j) ? gExp[i] / gExp[j] : 0  (causal-aware)
+            // qh_row[i] *= gExp[i]   （按行缩放，actBV 个元素）
+            // attn[i,j] *= (i>=j) ? gExp[i] / gExp[j] : 0   （结合因果性的 safe_exp）
             for (uint32_t i = 0; i < static_cast<uint32_t>(actBT); ++i) {
                 float ei = gVec.GetValue(i);
                 Muls(qh[i * bvAlign], qh[i * bvAlign], ei,
@@ -332,26 +333,26 @@ private:
                     float ej = gVec.GetValue(j);
                     float scl = (ej > 0.0f) ? (ei / ej) : 0.0f;
                     if (scl > 1.0f) {
-                        // Numerical guard: when g_i - g_j > 0 the original
-                        // safe_exp returns 0 (matches triton behaviour).
+                        // 数值保护：当 g_i - g_j > 0 时，原始 safe_exp 返回 0，
+                        // 与 triton kernel 行为保持一致。
                         scl = 0.0f;
                     }
                     float v0 = attn.GetValue(i * btAlign + j);
                     attn.SetValue(i * btAlign + j, v0 * scl);
                 }
-                // Strict upper triangle: attn[i,j>i] is wiped by the causal
-                // mask in step (d), no need to touch it here.
+                // 严格上三角部分 attn[i,j>i] 会在后续 (d) 中被因果 mask 清零，
+                // 此处无需再写入。
             }
             PipeBarrier<PIPE_V>();
             gQue_.FreeTensor(gVec);
         }
 
-        // ---- (d) Causal mask ----
+        // ---- (d) 因果 mask ----
         LocalTensor<float> mask = maskBuf_.Get<float>();
         Mul(attn, attn, mask, totalAttn);
         PipeBarrier<PIPE_V>();
 
-        // ---- (e) Cast attn fp32 -> Q_T, write to aftermaskWorkspace ----
+        // ---- (e) 将 attn 从 fp32 cast 为 Q_T，写入 aftermaskWorkspace ----
         LocalTensor<Q_T> attnQt = amQue_.AllocTensor<Q_T>();
         if constexpr (std::is_same<Q_T, half>::value) {
             Cast(attnQt, attn, AscendC::RoundMode::CAST_NONE, totalAttn);
@@ -366,10 +367,10 @@ private:
         amQue_.FreeTensor(attnQt);
         attnQue_.FreeTensor(attn);
 
-        // Tell AIC: A_masked is ready
+        // 通知 AIC：mask 后的 A 已就绪
         CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC_AV);
 
-        // ---- (f) Wait A@V result ----
+        // ---- (f) 等待 A@V 结果 ----
         CrossCoreWaitFlag(SYNC_AIC_TO_AIV_AV);
         LocalTensor<float> av = avQue_.AllocTensor<float>();
         GlobalTensor<float> vwsGm;
@@ -385,7 +386,7 @@ private:
         PipeBarrier<PIPE_V>();
         avQue_.FreeTensor(av);
 
-        // ---- (h) Cast out and store ----
+        // ---- (h) cast 输出并写回 GM ----
         LocalTensor<Q_T> outBuf = outQue_.AllocTensor<Q_T>();
         if constexpr (std::is_same<Q_T, half>::value) {
             Cast(outBuf, qh, AscendC::RoundMode::CAST_NONE, totalQH);
@@ -408,7 +409,7 @@ private:
         outQue_.FreeTensor(outBuf);
         qhQue_.FreeTensor(qh);
 
-        // Allow AIC to overwrite workspaces for the next chunk
+        // 允许 AIC 复用 workspace 处理下一 chunk
         CrossCoreSetFlag<2, PIPE_MTE3>(SYNC_AIV_TO_AIC_NEXT);
     }
 

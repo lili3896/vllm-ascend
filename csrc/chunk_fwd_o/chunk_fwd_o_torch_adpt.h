@@ -1,9 +1,11 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
+ * 本文件以 Apache License 2.0 协议发布，详见仓库根目录下的 LICENSE 文件。
  */
+
+// ChunkFwdO 算子的 PyTorch 适配层：把 at::Tensor 转发到 aclnnChunkFwdO。
+
 #ifndef CHUNK_FWD_O_TORCH_ADPT_H
 #define CHUNK_FWD_O_TORCH_ADPT_H
 
@@ -20,6 +22,7 @@ at::Tensor npu_chunk_fwd_o(
     double scale,
     int64_t chunk_size)
 {
+    // 输出 tensor 的 shape/dtype 与 v 一致，由调用方持有所有权。
     at::Tensor output = at::empty(v.sizes(), v.options());
     float scale_real = static_cast<float>(scale);
     EXEC_NPU_CMD(aclnnChunkFwdO,

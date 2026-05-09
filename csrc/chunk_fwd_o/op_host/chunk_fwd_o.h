@@ -7,6 +7,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+// ChunkFwdO 的 L0 op 接口声明：在图构建阶段把算子加入 launcher 列表。
+
 #ifndef OP_API_CHUNK_FWD_O_H
 #define OP_API_CHUNK_FWD_O_H
 
