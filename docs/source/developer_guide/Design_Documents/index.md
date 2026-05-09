@@ -17,4 +17,5 @@ context_parallel
 dynamic_chunked_pipeline_parallel
 quantization
 npugraph_ex
+chunk_o_triton
 :::
