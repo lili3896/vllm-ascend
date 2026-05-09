@@ -17,4 +17,6 @@ context_parallel
 dynamic_chunked_pipeline_parallel
 quantization
 npugraph_ex
+chunk_o_triton
+chunk_gated_delta_rule_o_ascendc
 :::
