@@ -9,8 +9,8 @@
 
 /*!
  * \file chunk_gated_delta_rule_o.cpp
- * \brief Kernel entry for ChunkGatedDeltaRuleO. Wraps the templated kernel
- *        class with a C ABI symbol that the runtime can launch.
+ * \brief Kernel entry for ChunkGatedDeltaRuleO. Runs in AIC + AIV mix mode
+ *        (1 AIC : 2 AIV) and dispatches to the corresponding template class.
  */
 
 #include "chunk_gated_delta_rule_o.h"
@@ -26,20 +26,30 @@ chunk_gated_delta_rule_o(GM_ADDR query, GM_ADDR key, GM_ADDR value,
                          GM_ADDR out,
                          GM_ADDR workspaceGM, GM_ADDR tilingGM)
 {
-    // 1. Register and fetch the TilingData blob produced by the host tiling.
     REGISTER_TILING_DEFAULT(ChunkGatedDeltaRuleOTilingData);
     GET_TILING_DATA(tilingData, tilingGM);
 
-    // 2. The kernel only uses the AIV (vector) cores; declare so the runtime
-    //    skips AIC scheduling.
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    // Cube/Vector mix mode: every AIC is paired with two AIVs. Use the macros
+    // ASCEND_IS_AIC / ASCEND_IS_AIV to compile-time select the half each
+    // physical core executes.
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
-    // 3. Prepare the TPipe and launch the templated kernel.
     TPipe pipe;
-    ChunkGatedDeltaRuleOKernel<bfloat16_t, bfloat16_t> op;
-    op.Init(query, key, value, h, g, cuSeqlens, chunkOffsets, out,
-            &tilingData, &pipe);
-    op.Process();
 
-    (void)workspaceGM;  // currently unused; reserved for future cube path
+    // Reserve user-side workspace area (the leading bytes of `workspaceGM`
+    // are reserved by the runtime for sync state).
+    GM_ADDR userWs = GetUserWorkspace(workspaceGM);
+
+    if ASCEND_IS_AIC {
+        ChunkGatedDeltaRuleOAicCore<bfloat16_t, bfloat16_t> aic;
+        aic.Init(query, key, value, h,
+                 cuSeqlens, chunkOffsets,
+                 userWs, &tilingData, &pipe);
+        aic.Process();
+    }
+    if ASCEND_IS_AIV {
+        ChunkGatedDeltaRuleOAivCore<bfloat16_t, bfloat16_t> aiv;
+        aiv.Init(g, cuSeqlens, chunkOffsets, out, userWs, &tilingData, &pipe);
+        aiv.Process();
+    }
 }

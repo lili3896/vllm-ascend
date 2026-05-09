@@ -9,131 +9,149 @@
 
 /*!
  * \file chunk_gated_delta_rule_o.h
- * \brief AscendC implementation of the GDN chunk-forward output kernel.
+ * \brief AscendC implementation of the GDN chunk-forward output kernel
+ *        (AIC + AIV mix mode, KERNEL_TYPE_MIX_AIC_1_2).
  *
- * This is the AscendC counterpart of the Triton kernel
- *   vllm_ascend/ops/triton/fla/chunk_o.py::chunk_fwd_kernel_o
- * It is intentionally kept as an AIV-only kernel mirroring the established
- * pattern of the sister operator csrc/recurrent_gated_delta_rule. Heavy
- * matmul-heavy paths can be migrated to AIC (Matmul high-level API) in the
- * future; the corresponding design is documented in
- *   docs/source/developer_guide/Design_Documents/chunk_gated_delta_rule_o_ascendc.md
+ * AIC pipeline (per chunk t):
+ *     MM1 = Matmul< Q [BT,K] , H_t [K,BV]   , out fp32 [BT,BV] >
+ *     MM2 = Matmul< Q [BT,K] , K_t^T [K,BT] , out fp32 [BT,BT] >  (transposeB)
+ *     -- wait MASK_DONE from AIV --
+ *     MM3 = Matmul< b_A_masked [BT,BT] bf16 , V_t [BT,BV] bf16 , out fp32 [BT,BV] >
  *
- * Design highlights:
- *  - Workload split: total work units = N * H * numVTile, distributed
- *    round-robin across AIVs. Each AIV iterates over its local units serially.
- *  - Per work unit: walk over chunks t = 0..NT-1; for each chunk run
- *      step 1: load Q_t, K_t, V_t, H_t, g_t into UB (with bf16 -> fp32 cast)
- *      step 2: compute b_o = Q_t @ H_t   (BT x BV, fp32 accumulator)
- *      step 3: compute b_A = Q_t @ K_t^T (BT x BT, fp32 accumulator)
- *      step 4: optional gating (USE_G):
- *                 b_o *= exp(g_t)[:, None]
- *                 b_A *= safe_exp(g_t[:, None] - g_t[None, :])
- *      step 5: causal mask: b_A = where(i >= j, b_A, 0)
- *      step 6: b_o = scale * b_o + scale * (b_A @ V_t)
- *      step 7: cast to bf16 and store back to o
- *  - Pipeline: PIPE_MTE2 (DataCopyPad) feeds PIPE_V (vector compute) feeds
- *    PIPE_MTE3 (DataCopyPad out). PipeBarrier<PIPE_V> separates dependent
- *    vector instructions; SetFlag<HardEvent::*> / WaitFlag<HardEvent::*> are
- *    used between PIPE_MTE2 -> PIPE_V and PIPE_V -> PIPE_MTE3 transitions
- *    that the compiler cannot infer because of pointer aliasing on the
- *    rolling reduction tile.
+ * AIV pipeline (per chunk t, two AIVs share the AIC's work; AIV0 does the
+ * upper half of BT rows, AIV1 does the lower half. The mask + cast workload
+ * is naturally split because the upper-triangular zeros do not depend on the
+ * lower rows):
+ *     -- wait MM12_DONE --
+ *     load c1 (mm1) + c2 (mm2) from workspace into UB (fp32)
+ *     [optional USE_G]
+ *         load g_t [BT] from GM
+ *         exp_g = Exp(g_t)
+ *         c1 row-wise *= exp_g[r]
+ *         c2[i,j] *= safe_exp(g[i] - g[j])           (vectorised by row)
+ *     causal mask: zero c2[i, j > i]
+ *     cast c2 (fp32) -> b_A_masked (bf16) -> back to workspace
+ *     -- set MASK_DONE --
+ *     -- wait MM3_DONE --
+ *     load c3 (mm3) from workspace into UB
+ *     b_o = scale * c1 + scale * c3
+ *     cast b_o (fp32) -> bf16, DataCopyPad to out_gm
+ *     -- set STORE_DONE --
+ *
+ * Cross-core sync uses 4 events with hard CrossCoreSetFlag/WaitFlag pairs:
+ *   E_MM12_DONE (AIC->AIV) : raised by AIC after MM2 finalises (PIPE_FIX)
+ *   E_MASK_DONE (AIV->AIC) : raised by AIV after b_A_masked written (PIPE_MTE3)
+ *   E_MM3_DONE  (AIC->AIV) : raised by AIC after MM3 finalises (PIPE_FIX)
+ *   E_STORE_DONE(AIV->AIC) : raised by AIV after out store (PIPE_MTE3)
+ * Each work unit uses ping-pong workspace slots (slot = chunkIdx % 2) so the
+ * AIC can start MM1+MM2 of chunk t+1 while AIV is processing chunk t.
  */
 
 #ifndef CHUNK_GATED_DELTA_RULE_O_KERNEL_H
 #define CHUNK_GATED_DELTA_RULE_O_KERNEL_H
 
 #include "kernel_operator.h"
+#include "lib/matmul_intf.h"
 #include "chunk_gated_delta_rule_o_tiling_data.h"
 
 namespace ChunkGatedDeltaRuleO {
 
 using namespace AscendC;
+using namespace matmul;
 
-constexpr uint32_t BF16_BYTES        = 2;
-constexpr uint32_t FP32_BYTES        = 4;
-constexpr uint32_t BF16_PER_BLOCK    = 16;   // 32B / sizeof(bf16)
-constexpr uint32_t FP32_PER_BLOCK    = 8;    // 32B / sizeof(fp32)
-constexpr uint32_t QUEUE_DEPTH       = 1;    // single-buffered queues
-constexpr uint32_t OUT_QUEUE_DEPTH   = 2;    // double-buffered output queues
+// --------------------------------------------------------------------------
+// Cross-core sync event ids. Picked to avoid the small ids the runtime may
+// already use internally.
+// --------------------------------------------------------------------------
+constexpr int32_t E_MM12_DONE  = 6;   // AIC -> AIV
+constexpr int32_t E_MASK_DONE  = 7;   // AIV -> AIC
+constexpr int32_t E_MM3_DONE   = 8;   // AIC -> AIV
+constexpr int32_t E_STORE_DONE = 9;   // AIV -> AIC (used to gate next chunk)
+
+constexpr uint32_t PING_PONG = 2;
+constexpr uint32_t BF16_PER_BLOCK = 16;
+constexpr uint32_t FP32_PER_BLOCK = 8;
 
 template <typename T>
 __aicore__ inline T CeilDivT(T a, T b) {
     return (b == 0) ? T(0) : T((a + b - 1) / b);
 }
 
-template <typename T>
-__aicore__ inline T CeilAlignT(T a, T b) {
-    return CeilDivT(a, b) * b;
-}
+// ==========================================================================
+// AIC half: drives the three Matmul instances.
+// ==========================================================================
 
-/*!
- * \brief Main kernel class for ChunkGatedDeltaRuleO.
- *
- * \tparam IN_T   data type of q/k/v/o (bfloat16_t in production)
- * \tparam HSTATE_T data type of h (bfloat16_t; matches v)
- */
-template <typename IN_T, typename HSTATE_T>
-class ChunkGatedDeltaRuleOKernel {
+template <typename IN_T, typename HSTATE_T, typename ACC_T = float>
+class ChunkGatedDeltaRuleOAicCore {
 public:
-    __aicore__ inline ChunkGatedDeltaRuleOKernel() = default;
+    // -- Matmul template plumbing ------------------------------------------
+    using QType  = MatmulType<TPosition::GM, CubeFormat::ND, IN_T,    false>;
+    using KTType = MatmulType<TPosition::GM, CubeFormat::ND, IN_T,    true>;   // transpose K
+    using HType  = MatmulType<TPosition::GM, CubeFormat::ND, HSTATE_T,false>;
+    using VType  = MatmulType<TPosition::GM, CubeFormat::ND, IN_T,    false>;
+    using AmaskType = MatmulType<TPosition::GM, CubeFormat::ND, IN_T, false>;  // bf16 b_A_masked
+    using CFp32   = MatmulType<TPosition::GM, CubeFormat::ND, ACC_T,  false>;
+    using BiasN   = MatmulType<TPosition::GM, CubeFormat::ND, ACC_T,  false>;
 
-    /*!
-     * \brief Bind kernel inputs and TilingData. Must be called before Process.
-     */
-    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v,
-                                GM_ADDR h, GM_ADDR g,
+    // mm1 = Q [BT,K] * H [K,BV] -> c1 [BT,BV] fp32
+    matmul::MatmulImpl<QType, HType, CFp32, BiasN> mm1_;
+    // mm2 = Q [BT,K] * K^T [K,BT] -> c2 [BT,BT] fp32  (transposeB)
+    matmul::MatmulImpl<QType, KTType, CFp32, BiasN> mm2_;
+    // mm3 = b_A_masked [BT,BT] bf16 * V [BT,BV] bf16 -> c3 [BT,BV] fp32
+    matmul::MatmulImpl<AmaskType, VType, CFp32, BiasN> mm3_;
+
+    __aicore__ inline ChunkGatedDeltaRuleOAicCore() = default;
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR h,
                                 GM_ADDR cuSeqlens, GM_ADDR chunkOffsets,
-                                GM_ADDR out,
+                                GM_ADDR workspace,
                                 const ChunkGatedDeltaRuleOTilingData *tiling,
                                 TPipe *pipe) {
-        // Save scalar TilingData fields into __ubuf__-friendly registers.
-        b_         = tiling->b;
-        tMax_      = tiling->t;
-        hg_        = tiling->hg;
-        h_         = tiling->h;
-        k_         = tiling->k;
-        v_         = tiling->v;
-        bt_        = tiling->bt;
-        bv_        = tiling->bv;
-        numVTile_  = tiling->numVTile;
-        numCores_  = tiling->numCores;
-        useG_      = (tiling->useG == 1);
-        isVarlen_  = (tiling->isVarlen == 1);
-        alignK_    = tiling->alignK;
-        alignV_    = tiling->alignV;
-        alignBT_   = tiling->alignBT;
-        scale_     = tiling->scale;
-        groupSize_ = (hg_ > 0) ? (h_ / hg_) : 1;  // GQA: group size
+        b_  = tiling->b;
+        tMax_ = tiling->t;
+        hg_ = tiling->hg;
+        h_  = tiling->h;
+        k_  = tiling->k;
+        v_  = tiling->v;
+        bt_ = tiling->bt;
+        bv_ = tiling->bv;
+        numVTile_ = tiling->numVTile;
+        aicNum_   = tiling->aicNum;
+        useG_     = (tiling->useG == 1);
+        isVarlen_ = (tiling->isVarlen == 1);
+        alignK_   = tiling->alignK;
+        alignV_   = tiling->alignV;
+        alignBT_  = tiling->alignBT;
+        wsBytesC1_       = tiling->wsBytesC1;
+        wsBytesC2_       = tiling->wsBytesC2;
+        wsBytesAmaskBf16_= tiling->wsBytesAmaskBf16;
+        wsBytesC3_       = tiling->wsBytesC3;
+        wsBytesPerSlot_  = tiling->wsBytesPerSlot;
+        wsBytesPerUnit_  = tiling->wsBytesPerUnit;
+        groupSize_ = (hg_ > 0) ? (h_ / hg_) : 1;
 
-        blockIdx_ = GetBlockIdx();
+        aicIdx_ = GetBlockIdx();   // index in AIC space (KERNEL_TYPE_MIX_AIC_1_2)
 
-        // Bind GlobalTensors.
         qGm_.SetGlobalBuffer((__gm__ IN_T *)q);
         kGm_.SetGlobalBuffer((__gm__ IN_T *)k);
         vGm_.SetGlobalBuffer((__gm__ IN_T *)v);
         hGm_.SetGlobalBuffer((__gm__ HSTATE_T *)h);
-        if (useG_) {
-            gGm_.SetGlobalBuffer((__gm__ float *)g);
-        }
         if (isVarlen_) {
             cuSeqlensGm_.SetGlobalBuffer((__gm__ int32_t *)cuSeqlens);
             chunkOffsetsGm_.SetGlobalBuffer((__gm__ int32_t *)chunkOffsets);
         }
-        outGm_.SetGlobalBuffer((__gm__ IN_T *)out);
+        wsGm_.SetGlobalBuffer((__gm__ uint8_t *)workspace);
 
-        pipe_ = pipe;
-        InitLocalBuffers();
+        // Bind Matmul instances to TPipe and their precomputed tilings.
+        mm1_.SetSubBlockIdx(0);
+        mm2_.SetSubBlockIdx(0);
+        mm3_.SetSubBlockIdx(0);
+        mm1_.Init(&tiling->mm1Tiling, pipe);
+        mm2_.Init(&tiling->mm2Tiling, pipe);
+        mm3_.Init(&tiling->mm3Tiling, pipe);
     }
 
-    /*!
-     * \brief Driver: walk through all (n, h, v_tile) work units owned by this
-     *        AIV and process them one by one.
-     */
     __aicore__ inline void Process() {
-        // Work-unit enumeration. We intentionally compute per-sequence NT here
-        // instead of on the device for varlen, because cuSeqlens lives in GM
-        // and the load is one int32 per seq.
         for (uint32_t nIdx = 0; nIdx < b_; ++nIdx) {
             uint32_t bos, eos;
             if (isVarlen_) {
@@ -151,18 +169,219 @@ public:
             }
             uint32_t nt = CeilDivT<uint32_t>(tThis, bt_);
 
-            // Walk every (head, vTile) pair owned by this core.
             for (uint32_t hIdx = 0; hIdx < h_; ++hIdx) {
                 for (uint32_t vTileIdx = 0; vTileIdx < numVTile_; ++vTileIdx) {
                     uint64_t unitId = (uint64_t)nIdx * h_ * numVTile_
                                     + (uint64_t)hIdx * numVTile_
                                     + vTileIdx;
-                    if ((unitId % numCores_) != static_cast<uint64_t>(blockIdx_)) {
+                    if ((unitId % aicNum_) != static_cast<uint64_t>(aicIdx_)) {
                         continue;
                     }
-                    curNidxForG_ = nIdx;
-                    curBosForG_  = bos;
-                    ProcessHeadVTile(nIdx, hIdx, vTileIdx, bos, tThis, nt);
+                    ProcessAicUnit(nIdx, hIdx, vTileIdx, bos, tThis, nt, unitId);
+                }
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessAicUnit(uint32_t nIdx, uint32_t hIdx,
+                                          uint32_t vTileIdx, uint32_t bos,
+                                          uint32_t tThis, uint32_t nt,
+                                          uint64_t unitId) {
+        const uint32_t kvHead = (groupSize_ > 0) ? (hIdx / groupSize_) : 0;
+        const uint32_t vStart = vTileIdx * bv_;
+        const uint32_t curBV  = (vStart + bv_ <= v_) ? bv_ : (v_ - vStart);
+        const uint64_t unitWsBase = unitId * wsBytesPerUnit_;
+
+        for (uint32_t tIdx = 0; tIdx < nt; ++tIdx) {
+            const uint32_t tokenStart = tIdx * bt_;
+            const uint32_t curBT      = (tokenStart + bt_ <= tThis)
+                                            ? bt_
+                                            : (tThis - tokenStart);
+            const uint32_t slot = tIdx & 1U;
+            const uint64_t slotBase = unitWsBase + slot * wsBytesPerSlot_;
+
+            // Compute GM offsets for the current (n, h, t, vTile) block.
+            const uint64_t qkBase = ((uint64_t)(bos + tokenStart) * hg_
+                                     + kvHead) * k_;
+            const uint64_t vBase  = ((uint64_t)(bos + tokenStart) * h_
+                                     + hIdx) * v_ + vStart;
+            const uint64_t hBase  = ((uint64_t)(bohN_ + tIdx) * h_ + hIdx)
+                                  * (uint64_t)k_ * v_ + vStart;
+
+            // Workspace pointers (cast back to typed GlobalTensor on AIV side).
+            uint64_t off = slotBase;
+            __gm__ ACC_T *c1Ptr  = reinterpret_cast<__gm__ ACC_T *>(wsGm_.GetPhyAddr() + off);
+            off += wsBytesC1_;
+            __gm__ ACC_T *c2Ptr  = reinterpret_cast<__gm__ ACC_T *>(wsGm_.GetPhyAddr() + off);
+            off += wsBytesC2_;
+            __gm__ IN_T  *amskPtr= reinterpret_cast<__gm__ IN_T *>(wsGm_.GetPhyAddr() + off);
+            off += wsBytesAmaskBf16_;
+            __gm__ ACC_T *c3Ptr  = reinterpret_cast<__gm__ ACC_T *>(wsGm_.GetPhyAddr() + off);
+
+            GlobalTensor<ACC_T> c1Gm, c2Gm, c3Gm;
+            GlobalTensor<IN_T>  amskGm;
+            c1Gm.SetGlobalBuffer(c1Ptr);
+            c2Gm.SetGlobalBuffer(c2Ptr);
+            c3Gm.SetGlobalBuffer(c3Ptr);
+            amskGm.SetGlobalBuffer(amskPtr);
+
+            // -------- MM1 : c1 = Q_t @ H_t --------------------------------
+            // Q is [T, Hg, K] -> per-token leading dim of A is Hg*K.
+            // H is [K, V]      -> per-row leading dim of B is v_ (V_full).
+            // C is [BT, BV]    -> packed in workspace with leading dim alignV_.
+            mm1_.SetOrgShape(curBT, curBV, hg_ * k_, v_, alignV_);
+            mm1_.SetSingleShape(curBT, curBV, k_);
+            mm1_.SetTensorA(qGm_[qkBase], false);
+            mm1_.SetTensorB(hGm_[hBase], false);
+            mm1_.template IterateAll<false>(c1Gm, /*sync=*/0);
+
+            // -------- MM2 : c2 = Q_t @ K_t^T ------------------------------
+            // K is [T, Hg, K]   -> with transposeB the cube reads K^T whose
+            // leading dim of B (K^T) is also hg_*k_ (the K-axis stride).
+            // C is [BT, BT]     -> packed in workspace with leading dim alignBT_.
+            mm2_.SetOrgShape(curBT, curBT, hg_ * k_, hg_ * k_, alignBT_);
+            mm2_.SetSingleShape(curBT, curBT, k_);
+            mm2_.SetTensorA(qGm_[qkBase], false);
+            mm2_.SetTensorB(kGm_[qkBase], true);
+            mm2_.template IterateAll<false>(c2Gm, /*sync=*/0);
+
+            // Tell AIV that c1, c2 are ready.
+            CrossCoreSetFlag<0x2, PIPE_FIX>(E_MM12_DONE);
+
+            // Wait until AIV finished masking c2 -> b_A_masked (bf16).
+            CrossCoreWaitFlag(E_MASK_DONE);
+
+            // -------- MM3 : c3 = b_A_masked @ V_t -------------------------
+            // b_A_masked is [BT, BT] packed in workspace with M-stride =
+            //   alignBT_ (per-row leading dim in K direction).
+            // V is [T, H, V] sliced [BT, BV] with K-stride (token stride) =
+            //   h_*v_ (per row in K direction).
+            // c3 is [BT, BV] packed with leading dim alignV_.
+            mm3_.SetOrgShape(curBT, curBV, alignBT_, h_ * v_, alignV_);
+            mm3_.SetSingleShape(curBT, curBV, curBT);
+            mm3_.SetTensorA(amskGm, false);
+            mm3_.SetTensorB(vGm_[vBase], false);
+            mm3_.template IterateAll<false>(c3Gm, /*sync=*/0);
+
+            CrossCoreSetFlag<0x2, PIPE_FIX>(E_MM3_DONE);
+
+            // Wait for AIV to finish the store of chunk t before reusing the
+            // ping-pong slot two chunks later. We only need to gate when we
+            // are about to overwrite the slot, so this is a coarse barrier
+            // every iteration; per-slot fine-grained gating is a possible
+            // optimisation but adds little since cube and vector latencies
+            // are well balanced for these tile sizes.
+            CrossCoreWaitFlag(E_STORE_DONE);
+        }
+    }
+
+    // ---- Cached TilingData ------------------------------------------------
+    uint32_t b_{0}, tMax_{0}, hg_{0}, h_{0}, k_{0}, v_{0}, bt_{0}, bv_{0};
+    uint32_t numVTile_{0}, aicNum_{0};
+    uint32_t alignK_{0}, alignV_{0}, alignBT_{0}, groupSize_{1};
+    bool     useG_{false}, isVarlen_{false};
+    uint32_t wsBytesC1_{0}, wsBytesC2_{0}, wsBytesAmaskBf16_{0}, wsBytesC3_{0};
+    uint32_t wsBytesPerSlot_{0}, wsBytesPerUnit_{0};
+    uint32_t bohN_{0};
+    int32_t  aicIdx_{0};
+
+    GlobalTensor<IN_T>     qGm_;
+    GlobalTensor<IN_T>     kGm_;
+    GlobalTensor<IN_T>     vGm_;
+    GlobalTensor<HSTATE_T> hGm_;
+    GlobalTensor<int32_t>  cuSeqlensGm_;
+    GlobalTensor<int32_t>  chunkOffsetsGm_;
+    GlobalTensor<uint8_t>  wsGm_;
+};
+
+// ==========================================================================
+// AIV half: gating, mask, scale composition, cast and store. Two AIVs share
+// every AIC; we split the BT row dim 50/50 between them.
+// ==========================================================================
+
+template <typename IN_T, typename HSTATE_T, typename ACC_T = float>
+class ChunkGatedDeltaRuleOAivCore {
+public:
+    __aicore__ inline ChunkGatedDeltaRuleOAivCore() = default;
+
+    __aicore__ inline void Init(GM_ADDR g, GM_ADDR cuSeqlens,
+                                GM_ADDR chunkOffsets, GM_ADDR out,
+                                GM_ADDR workspace,
+                                const ChunkGatedDeltaRuleOTilingData *tiling,
+                                TPipe *pipe) {
+        b_  = tiling->b;
+        tMax_ = tiling->t;
+        hg_ = tiling->hg;
+        h_  = tiling->h;
+        k_  = tiling->k;
+        v_  = tiling->v;
+        bt_ = tiling->bt;
+        bv_ = tiling->bv;
+        numVTile_ = tiling->numVTile;
+        aicNum_   = tiling->aicNum;
+        useG_     = (tiling->useG == 1);
+        isVarlen_ = (tiling->isVarlen == 1);
+        alignK_   = tiling->alignK;
+        alignV_   = tiling->alignV;
+        alignBT_  = tiling->alignBT;
+        scale_    = tiling->scale;
+        wsBytesC1_       = tiling->wsBytesC1;
+        wsBytesC2_       = tiling->wsBytesC2;
+        wsBytesAmaskBf16_= tiling->wsBytesAmaskBf16;
+        wsBytesC3_       = tiling->wsBytesC3;
+        wsBytesPerSlot_  = tiling->wsBytesPerSlot;
+        wsBytesPerUnit_  = tiling->wsBytesPerUnit;
+        groupSize_ = (hg_ > 0) ? (h_ / hg_) : 1;
+
+        // In KERNEL_TYPE_MIX_AIC_1_2 each AIC has 2 AIVs. GetBlockIdx() on
+        // AIV returns the AIV index. Pair (aiv0, aiv1) belongs to AIC i =
+        // aivIdx / 2; subBlock = aivIdx & 1 picks the upper or lower row half.
+        aivIdx_ = GetBlockIdx();
+        aicIdx_ = aivIdx_ / 2;
+        subBlock_ = aivIdx_ & 1;
+
+        if (useG_) {
+            gGm_.SetGlobalBuffer((__gm__ float *)g);
+        }
+        if (isVarlen_) {
+            cuSeqlensGm_.SetGlobalBuffer((__gm__ int32_t *)cuSeqlens);
+            chunkOffsetsGm_.SetGlobalBuffer((__gm__ int32_t *)chunkOffsets);
+        }
+        outGm_.SetGlobalBuffer((__gm__ IN_T *)out);
+        wsGm_.SetGlobalBuffer((__gm__ uint8_t *)workspace);
+
+        pipe_ = pipe;
+        InitLocalBuffers();
+    }
+
+    __aicore__ inline void Process() {
+        for (uint32_t nIdx = 0; nIdx < b_; ++nIdx) {
+            uint32_t bos, eos;
+            if (isVarlen_) {
+                bos = static_cast<uint32_t>(cuSeqlensGm_.GetValue(nIdx));
+                eos = static_cast<uint32_t>(cuSeqlensGm_.GetValue(nIdx + 1));
+            } else {
+                bos = nIdx * tMax_;
+                eos = bos + tMax_;
+            }
+            uint32_t tThis = (eos > bos) ? (eos - bos) : 0;
+            if (tThis == 0) {
+                continue;
+            }
+            uint32_t nt = CeilDivT<uint32_t>(tThis, bt_);
+
+            for (uint32_t hIdx = 0; hIdx < h_; ++hIdx) {
+                for (uint32_t vTileIdx = 0; vTileIdx < numVTile_; ++vTileIdx) {
+                    uint64_t unitId = (uint64_t)nIdx * h_ * numVTile_
+                                    + (uint64_t)hIdx * numVTile_
+                                    + vTileIdx;
+                    if ((unitId % aicNum_) != static_cast<uint64_t>(aicIdx_)) {
+                        continue;
+                    }
+                    curNidx_ = nIdx;
+                    curBos_  = bos;
+                    ProcessAivUnit(nIdx, hIdx, vTileIdx, bos, tThis, nt, unitId);
                 }
             }
         }
@@ -170,519 +389,350 @@ public:
 
 private:
     /*!
-     * \brief Allocate UB queues and scratch buffers.
+     * \brief Allocate UB buffers used by the AIV half.
      *
-     * UB layout (sized to BT=64, BV=64, K=128, V=128, bf16):
-     *   qInQueue  : BT * alignK * sizeof(bf16)              =  16 KiB
-     *   kInQueue  : BT * alignK * sizeof(bf16)              =  16 KiB
-     *   vInQueue  : BT * alignBV * sizeof(bf16)             =   8 KiB
-     *   hInQueue  : alignK * alignBV * sizeof(bf16)         =  16 KiB
-     *   gInQueue  : alignBT * sizeof(fp32)                  = 256 B
-     *   outQueue  : BT * alignBV * sizeof(bf16) (depth 2)   =  16 KiB
+     * UB plan (BT=64, BV=64): each AIV processes BT/2 = 32 rows, so the
+     * buffers are sized to halfBT = 32 rows.
+     *
+     *   c1Que (fp32) : halfBT * alignV  =  8 KiB
+     *   c2Que (fp32) : halfBT * alignBT =  8 KiB
+     *   c3Que (fp32) : halfBT * alignV  =  8 KiB
+     *   amskQue(bf16): halfBT * alignBT =  4 KiB
+     *   outQue (bf16): halfBT * alignV  =  4 KiB    (depth 2 = 8 KiB)
+     *   gQue   (fp32): alignBT          = 256 B
      *   scratch (TBuf):
-     *     b_o   : BT * alignBV * sizeof(fp32)               =  16 KiB
-     *     b_A   : BT * alignBT * sizeof(fp32)               =  16 KiB
-     *     b_q_f : BT * alignK  * sizeof(fp32)               =  32 KiB
-     *     b_k_f : BT * alignK  * sizeof(fp32)               =  32 KiB
-     *     b_v_f : BT * alignBV * sizeof(fp32)               =  16 KiB
-     *     b_h_f : alignK * alignBV * sizeof(fp32)           =  32 KiB
-     *     b_g   : alignBT * sizeof(fp32)                    = 256 B
-     *     b_eg  : alignBT * sizeof(fp32) (= exp(g))         = 256 B
-     *     row_acc : alignBV * sizeof(fp32) (per-row accum)  = 256 B
-     *   Total ~ 220 KiB which fits in 256 KiB UB.
+     *     gExp_ (fp32, alignBT)             = 256 B
+     *     diff_ (fp32, alignBT)             = 256 B
+     *     boFp_ (fp32, halfBT*alignV)       = 8 KiB
+     *     rowAcc_ (fp32, alignBT)           = 256 B
+     *
+     *   Total ≈ 50 KiB which leaves abundant slack in the 128 KiB AIV-side UB.
      */
     __aicore__ inline void InitLocalBuffers() {
-        const uint32_t qBytes  = bt_ * alignK_  * sizeof(IN_T);
-        const uint32_t kBytes  = bt_ * alignK_  * sizeof(IN_T);
-        const uint32_t vBytes  = bt_ * alignV_  * sizeof(IN_T);  // V-tile padded
-        const uint32_t hBytes  = alignK_ * alignV_ * sizeof(HSTATE_T);
-        const uint32_t gBytes  = alignBT_ * sizeof(float);
-        const uint32_t oBytes  = bt_ * alignV_  * sizeof(IN_T);
+        halfBT_  = (bt_ + 1) / 2;
+        rowOff_  = subBlock_ * halfBT_;          // first row this AIV handles
+        rowsThis_ = (subBlock_ == 0) ? halfBT_ : (bt_ - halfBT_);
 
-        pipe_->InitBuffer(qInQueue_, QUEUE_DEPTH, qBytes);
-        pipe_->InitBuffer(kInQueue_, QUEUE_DEPTH, kBytes);
-        pipe_->InitBuffer(vInQueue_, QUEUE_DEPTH, vBytes);
-        pipe_->InitBuffer(hInQueue_, QUEUE_DEPTH, hBytes);
+        const uint32_t c1Bytes  = halfBT_ * alignV_  * sizeof(ACC_T);
+        const uint32_t c2Bytes  = halfBT_ * alignBT_ * sizeof(ACC_T);
+        const uint32_t c3Bytes  = halfBT_ * alignV_  * sizeof(ACC_T);
+        const uint32_t amBytes  = halfBT_ * alignBT_ * sizeof(IN_T);
+        const uint32_t oBytes   = halfBT_ * alignV_  * sizeof(IN_T);
+        const uint32_t gBytes   = alignBT_           * sizeof(ACC_T);
+
+        pipe_->InitBuffer(c1Que_,  1, c1Bytes);
+        pipe_->InitBuffer(c2Que_,  1, c2Bytes);
+        pipe_->InitBuffer(c3Que_,  1, c3Bytes);
+        pipe_->InitBuffer(amQue_,  1, amBytes);
+        pipe_->InitBuffer(outQue_, 2, oBytes);
         if (useG_) {
-            pipe_->InitBuffer(gInQueue_, QUEUE_DEPTH, gBytes);
+            pipe_->InitBuffer(gQue_, 1, gBytes);
         }
-        pipe_->InitBuffer(outQueue_, OUT_QUEUE_DEPTH, oBytes);
 
-        const uint32_t boFp32Bytes  = bt_ * alignV_  * sizeof(float);
-        const uint32_t bAFp32Bytes  = bt_ * alignBT_ * sizeof(float);
-        const uint32_t qFp32Bytes   = bt_ * alignK_  * sizeof(float);
-        const uint32_t kFp32Bytes   = bt_ * alignK_  * sizeof(float);
-        const uint32_t vFp32Bytes   = bt_ * alignV_  * sizeof(float);
-        const uint32_t hFp32Bytes   = alignK_ * alignV_ * sizeof(float);
-        const uint32_t gExpBytes    = alignBT_ * sizeof(float);
-        const uint32_t rowBytes     = alignV_ * sizeof(float);
-
-        const uint32_t scratchBytes = boFp32Bytes + bAFp32Bytes + qFp32Bytes
-                                    + kFp32Bytes + vFp32Bytes + hFp32Bytes
-                                    + 2 * gExpBytes + rowBytes;
+        const uint32_t scratchBytes =
+            /*gExp_ */ alignBT_ * sizeof(ACC_T)
+          + /*diff_ */ alignBT_ * sizeof(ACC_T)
+          + /*boFp_ */ halfBT_ * alignV_ * sizeof(ACC_T)
+          + /*rowAcc*/ alignBT_ * sizeof(ACC_T);
         pipe_->InitBuffer(scratch_, scratchBytes);
 
         uint32_t off = 0;
-        boFp32_ = scratch_.GetWithOffset<float>(bt_ * alignV_, off);  off += boFp32Bytes;
-        bAFp32_ = scratch_.GetWithOffset<float>(bt_ * alignBT_, off); off += bAFp32Bytes;
-        qFp32_  = scratch_.GetWithOffset<float>(bt_ * alignK_,  off); off += qFp32Bytes;
-        kFp32_  = scratch_.GetWithOffset<float>(bt_ * alignK_,  off); off += kFp32Bytes;
-        vFp32_  = scratch_.GetWithOffset<float>(bt_ * alignV_,  off); off += vFp32Bytes;
-        hFp32_  = scratch_.GetWithOffset<float>(alignK_ * alignV_, off); off += hFp32Bytes;
-        gFp32_  = scratch_.GetWithOffset<float>(alignBT_, off);       off += gExpBytes;
-        gExp_   = scratch_.GetWithOffset<float>(alignBT_, off);       off += gExpBytes;
-        rowAcc_ = scratch_.GetWithOffset<float>(alignV_, off);
+        gExp_   = scratch_.GetWithOffset<ACC_T>(alignBT_, off);
+        off    += alignBT_ * sizeof(ACC_T);
+        diff_   = scratch_.GetWithOffset<ACC_T>(alignBT_, off);
+        off    += alignBT_ * sizeof(ACC_T);
+        boFp_   = scratch_.GetWithOffset<ACC_T>(halfBT_ * alignV_, off);
+        off    += halfBT_ * alignV_ * sizeof(ACC_T);
+        rowAcc_ = scratch_.GetWithOffset<ACC_T>(alignBT_, off);
     }
 
-    /*!
-     * \brief Process all chunks of one (sequence, head, vTile) work unit.
-     */
-    __aicore__ inline void ProcessHeadVTile(uint32_t nIdx, uint32_t hIdx,
-                                            uint32_t vTileIdx, uint32_t bos,
-                                            uint32_t tThis, uint32_t nt) {
-        const uint32_t kvHead = (groupSize_ > 0) ? (hIdx / groupSize_) : 0;
+    __aicore__ inline void ProcessAivUnit(uint32_t nIdx, uint32_t hIdx,
+                                          uint32_t vTileIdx, uint32_t bos,
+                                          uint32_t tThis, uint32_t nt,
+                                          uint64_t unitId) {
         const uint32_t vStart = vTileIdx * bv_;
         const uint32_t curBV  = (vStart + bv_ <= v_) ? bv_ : (v_ - vStart);
+        const uint64_t unitWsBase = unitId * wsBytesPerUnit_;
 
         for (uint32_t tIdx = 0; tIdx < nt; ++tIdx) {
             const uint32_t tokenStart = tIdx * bt_;
             const uint32_t curBT      = (tokenStart + bt_ <= tThis)
                                             ? bt_
                                             : (tThis - tokenStart);
-            const uint64_t globalChunkIdx = bohN_ + tIdx;
+            const uint32_t myRows = ComputeMyRows(curBT);
+            const uint32_t slot   = tIdx & 1U;
+            const uint64_t slotBase = unitWsBase + slot * wsBytesPerSlot_;
 
-            // Step 1: copy Q_t, K_t, V_t, H_t (and g_t if needed) into UB.
-            CopyInQK(bos + tokenStart, kvHead, curBT);
-            CopyInV(bos + tokenStart, hIdx, vStart, curBT, curBV);
-            CopyInH(globalChunkIdx, hIdx, vStart, curBV);
-            if (useG_) {
-                CopyInG(bos + tokenStart, hIdx, curBT);
+            // 1) Wait MM1 + MM2 done on AIC.
+            CrossCoreWaitFlag(E_MM12_DONE);
+
+            if (myRows > 0) {
+                // 2) Load c1, c2 from workspace into UB; build b_A_masked.
+                LocalTensor<ACC_T> c1 = LoadFp32(slotBase + 0,
+                                                 c1Que_, myRows, alignV_);
+                LocalTensor<ACC_T> c2 = LoadFp32(slotBase + wsBytesC1_,
+                                                 c2Que_, myRows, alignBT_);
+                LocalTensor<ACC_T> g;
+                if (useG_) g = LoadG(bos + tokenStart, hIdx, curBT);
+                ApplyGatingAndMask(c1, c2, g, myRows, curBT);
+                if (useG_) gQue_.FreeTensor(g);
+
+                // 3) Cast masked c2 (fp32) -> bf16, write back to workspace.
+                CastAndStoreAmask(c2, slotBase + wsBytesC1_ + wsBytesC2_,
+                                  myRows);
+                c2Que_.FreeTensor(c2);
+
+                // Hold c1 for the combine step (re-use after MM3_DONE).
+                heldC1_ = c1;
+                heldC1Valid_ = true;
+            } else {
+                heldC1Valid_ = false;
             }
 
-            // Step 2 & 3: compute b_o (BT, BV) and b_A (BT, BT).
-            ComputeQH(curBT, curBV);                   // b_o += Q_t @ H_t
-            ComputeQKt(curBT);                         // b_A  = Q_t @ K_t^T
-            // Free q/k/h/v queues now that fp32 working buffers hold the data.
-            FreeAfterCompute();
+            // Always raise MASK_DONE so AIC can proceed with MM3.
+            CrossCoreSetFlag<0x2, PIPE_MTE3>(E_MASK_DONE);
 
-            // Step 4: gating.
-            if (useG_) {
-                ApplyGating(curBT, curBV);
+            // 4) Wait MM3 done on AIC.
+            CrossCoreWaitFlag(E_MM3_DONE);
+
+            if (myRows > 0) {
+                // 5) Load c3 and combine with c1.
+                LocalTensor<ACC_T> c3 = LoadFp32(
+                    slotBase + wsBytesC1_ + wsBytesC2_ + wsBytesAmaskBf16_,
+                    c3Que_, myRows, alignV_);
+                ComposeAndStore(heldC1_, c3, bos + tokenStart, hIdx, vStart,
+                                curBV, myRows);
+                c1Que_.FreeTensor(heldC1_);
+                c3Que_.FreeTensor(c3);
+                heldC1Valid_ = false;
             }
-
-            // Step 5: causal mask on b_A and Step 6: combine with V_t.
-            ApplyCausalMaskAndCombine(curBT, curBV);
-
-            // Step 7: cast to bf16 and store back to o.
-            CastAndStoreOut(bos + tokenStart, hIdx, vStart, curBT, curBV);
+            // Always raise STORE_DONE so AIC can free this slot.
+            CrossCoreSetFlag<0x2, PIPE_MTE3>(E_STORE_DONE);
         }
     }
 
-    // ------------------------------------------------------------------
-    // Step 1: Copy Inputs
-    // ------------------------------------------------------------------
-
-    /*!
-     * \brief Copy a Q/K chunk slice into UB and cast it to fp32 working buffers.
-     *
-     * Source layout: q,k are [B, T, Hg, K] contiguous.
-     *   token_offset_in_seq * (Hg * K) + kv_head * K
-     * is the start of the row block this chunk needs.
-     * One row of the chunk equals one full token's K vector for this head.
-     * We use DataCopyPad with srcStride to skip the other Hg-1 KV heads per
-     * token (the kv stride between consecutive tokens).
-     */
-    __aicore__ inline void CopyInQK(uint32_t globalToken, uint32_t kvHead,
-                                    uint32_t curBT) {
-        const uint64_t rowStart = (uint64_t)globalToken * hg_ * k_
-                                + (uint64_t)kvHead * k_;
-
-        DataCopyExtParams qkParams{
-            static_cast<uint16_t>(curBT),
-            static_cast<uint32_t>(k_ * sizeof(IN_T)),
-            static_cast<uint32_t>((hg_ - 1) * k_ * sizeof(IN_T)),  // srcStride bytes
-            0,                                                      // dstStride blocks
-            0,                                                      // rsv
-        };
-        DataCopyPadExtParams<IN_T> qkPad{
-            true, 0,
-            static_cast<uint8_t>(alignK_ - k_),  // pad in datablock units
-            0,
-        };
-
-        LocalTensor<IN_T> qLocal = qInQueue_.AllocTensor<IN_T>();
-        DataCopyPad(qLocal, qGm_[rowStart], qkParams, qkPad);
-        qInQueue_.EnQue<IN_T>(qLocal);
-
-        LocalTensor<IN_T> kLocal = kInQueue_.AllocTensor<IN_T>();
-        DataCopyPad(kLocal, kGm_[rowStart], qkParams, qkPad);
-        kInQueue_.EnQue<IN_T>(kLocal);
-
-        // Cast to fp32 working buffers; multiply Q by scale on the fly to fold
-        // the scale into b_o = scale * (Q @ H) + scale * (b_A @ V) -- since b_o
-        // accumulates Q @ H, doing this cast-then-Muls saves one extra pass.
-        // Note: we apply *scale* later (to keep both terms consistent and to
-        // mirror the Triton kernel which multiplies after the dot products);
-        // here we only cast.
-        qLocal = qInQueue_.DeQue<IN_T>();
-        kLocal = kInQueue_.DeQue<IN_T>();
-        Cast(qFp32_, qLocal, RoundMode::CAST_NONE, curBT * alignK_);
-        Cast(kFp32_, kLocal, RoundMode::CAST_NONE, curBT * alignK_);
-        PipeBarrier<PIPE_V>();
-        qInQueue_.FreeTensor(qLocal);
-        kInQueue_.FreeTensor(kLocal);
+    __aicore__ inline uint32_t ComputeMyRows(uint32_t curBT) const {
+        if (rowOff_ >= curBT) {
+            return 0;
+        }
+        return (rowOff_ + rowsThis_ <= curBT) ? rowsThis_ : (curBT - rowOff_);
     }
 
     /*!
-     * \brief Copy V chunk slice (V-tile only) into UB and cast.
-     *
-     * V is [B, T, H, V_full]; we only need the [BT, BV] submatrix:
-     *   for token in [tokenStart, tokenStart+curBT):
-     *     v[token, hIdx, vStart : vStart+curBV]
+     * \brief Allocate from `que`, copy `rows × cols` fp32 block from workspace
+     *        at `wsByteOff` starting at row `rowOff_` of the BT slot, and
+     *        return the dequeued LocalTensor.
      */
-    __aicore__ inline void CopyInV(uint32_t globalToken, uint32_t hIdx,
-                                   uint32_t vStart, uint32_t curBT,
-                                   uint32_t curBV) {
-        const uint64_t rowStart = (uint64_t)globalToken * h_ * v_
-                                + (uint64_t)hIdx * v_
-                                + vStart;
-        DataCopyExtParams vParams{
-            static_cast<uint16_t>(curBT),
-            static_cast<uint32_t>(curBV * sizeof(IN_T)),
-            static_cast<uint32_t>((h_ * v_ - curBV) * sizeof(IN_T)),
-            0, 0,
-        };
-        DataCopyPadExtParams<IN_T> vPad{
-            true, 0,
-            static_cast<uint8_t>(alignV_ - curBV), 0,
-        };
+    __aicore__ inline LocalTensor<ACC_T> LoadFp32(uint64_t wsByteOff,
+                                                  TQue<QuePosition::VECIN, 1> &que,
+                                                  uint32_t rows, uint32_t cols) {
+        const uint64_t rowOffBytes = (uint64_t)rowOff_ * cols * sizeof(ACC_T);
+        __gm__ ACC_T *src = reinterpret_cast<__gm__ ACC_T *>(
+            wsGm_.GetPhyAddr() + wsByteOff + rowOffBytes);
+        GlobalTensor<ACC_T> srcGm;
+        srcGm.SetGlobalBuffer(src);
 
-        LocalTensor<IN_T> vLocal = vInQueue_.AllocTensor<IN_T>();
-        DataCopyPad(vLocal, vGm_[rowStart], vParams, vPad);
-        vInQueue_.EnQue<IN_T>(vLocal);
-        vLocal = vInQueue_.DeQue<IN_T>();
-        Cast(vFp32_, vLocal, RoundMode::CAST_NONE, curBT * alignV_);
-        PipeBarrier<PIPE_V>();
-        vInQueue_.FreeTensor(vLocal);
-    }
-
-    /*!
-     * \brief Copy H chunk slice (K x BV) into UB and cast.
-     *
-     * H is [B, NT_total, H, K, V_full]. The [K, BV] submatrix at the
-     * (globalChunkIdx, hIdx) head, V-tile starting at vStart, is laid out
-     * with row stride = V_full bytes.
-     */
-    __aicore__ inline void CopyInH(uint64_t globalChunkIdx, uint32_t hIdx,
-                                   uint32_t vStart, uint32_t curBV) {
-        const uint64_t baseElem = (globalChunkIdx * h_ + hIdx)
-                                * (uint64_t)k_ * v_
-                                + vStart;
-        DataCopyExtParams hParams{
-            static_cast<uint16_t>(k_),
-            static_cast<uint32_t>(curBV * sizeof(HSTATE_T)),
-            static_cast<uint32_t>((v_ - curBV) * sizeof(HSTATE_T)),
-            0, 0,
-        };
-        DataCopyPadExtParams<HSTATE_T> hPad{
-            true, 0,
-            static_cast<uint8_t>(alignV_ - curBV), 0,
-        };
-
-        LocalTensor<HSTATE_T> hLocal = hInQueue_.AllocTensor<HSTATE_T>();
-        DataCopyPad(hLocal, hGm_[baseElem], hParams, hPad);
-        hInQueue_.EnQue<HSTATE_T>(hLocal);
-        hLocal = hInQueue_.DeQue<HSTATE_T>();
-        Cast(hFp32_, hLocal, RoundMode::CAST_NONE, k_ * alignV_);
-        PipeBarrier<PIPE_V>();
-        hInQueue_.FreeTensor(hLocal);
-    }
-
-    /*!
-     * \brief Copy g (BT scalars) into UB.
-     *
-     * g has been transposed to [B, H, T] on the host so that for a given head
-     * the BT values are contiguous. The starting offset is
-     *   nIdx*H*T_max + hIdx*T_max + tokenInSeq
-     * but here we already have globalToken = bos + tokenStart so the offset
-     * collapses to:
-     *   globalToken     (within the per-head slice)
-     * Wait: g is [B, H, T_max]. nIdx is the *batch* index of g, but
-     * globalToken = bos + tokenStart and bos = nIdx*T_max for fixed-len. For
-     * varlen, g still has shape [B, H, T_max] (padded), so we have to compute
-     * the offset from (nIdx, hIdx, tokenInSeq) explicitly.
-     */
-    __aicore__ inline void CopyInG(uint32_t globalToken, uint32_t hIdx,
-                                   uint32_t curBT) {
-        // Recover (nIdx, tokenInSeq) from globalToken: with varlen, globalToken
-        // is the absolute token index (already shifted by bos), so we need
-        // tokenInSeq = globalToken - bos. We carry bos via curBosForG_.
-        const uint32_t tokenInSeq = globalToken - curBosForG_;
-        const uint64_t off = (uint64_t)curNidxForG_ * h_ * tMax_
-                           + (uint64_t)hIdx * tMax_
-                           + tokenInSeq;
-        DataCopyExtParams gParams{
-            1,
-            static_cast<uint32_t>(curBT * sizeof(float)),
+        LocalTensor<ACC_T> dst = que.AllocTensor<ACC_T>();
+        DataCopyExtParams params{
+            static_cast<uint16_t>(rows),
+            static_cast<uint32_t>(cols * sizeof(ACC_T)),
             0, 0, 0,
         };
-        DataCopyPadExtParams<float> gPad{
-            true, 0,
-            static_cast<uint8_t>(alignBT_ - curBT), 0,
+        DataCopyPadExtParams<ACC_T> pad{true, 0, 0, 0};
+        DataCopyPad(dst, srcGm, params, pad);
+        que.EnQue<ACC_T>(dst);
+        return que.DeQue<ACC_T>();
+    }
+
+    /*!
+     * \brief Load g [BT] for this chunk and return the dequeued LocalTensor.
+     *
+     * g has been transposed to [B, H, T] on the host so that values for one
+     * (n, h) pair are contiguous over the time dim.
+     */
+    __aicore__ inline LocalTensor<ACC_T> LoadG(uint32_t globalToken,
+                                               uint32_t hIdx,
+                                               uint32_t curBT) {
+        const uint32_t tokenInSeq = globalToken - curBos_;
+        const uint64_t off = (uint64_t)curNidx_ * h_ * tMax_
+                           + (uint64_t)hIdx * tMax_ + tokenInSeq;
+        DataCopyExtParams params{
+            1, static_cast<uint32_t>(curBT * sizeof(ACC_T)), 0, 0, 0,
         };
-
-        LocalTensor<float> gLocal = gInQueue_.AllocTensor<float>();
-        DataCopyPad(gLocal, gGm_[off], gParams, gPad);
-        gInQueue_.EnQue<float>(gLocal);
-        gLocal = gInQueue_.DeQue<float>();
-        DataCopy(gFp32_, gLocal, alignBT_);
-        PipeBarrier<PIPE_V>();
-        gInQueue_.FreeTensor(gLocal);
-    }
-
-    // ------------------------------------------------------------------
-    // Step 2 & 3: matmul-by-row (AIV emulation)
-    // ------------------------------------------------------------------
-
-    /*!
-     * \brief Compute b_o = Q_t @ H_t  (shape [BT, alignV]).
-     *
-     * Outer product accumulation: for each k in [0, K), b_o += Q_t[:, k] *
-     * H_t[k, :]. With BT=64 rows and BV=64 cols and K=128 reduction, the inner
-     * loop has 128 vector-vector MulAddDst ops of length alignV.
-     *
-     * Implementation pattern uses MulAddDst across rows, where the per-row
-     * scalar Q_t[r, k] is fetched via GetValue (BT * K = 8K scalar loads
-     * total). The vector body fully utilises the V-vector unit. This mirrors
-     * the MatVecMul pattern in csrc/recurrent_gated_delta_rule.
-     */
-    __aicore__ inline void ComputeQH(uint32_t curBT, uint32_t curBV) {
-        // Initialise the BT x alignV accumulator to zero.
-        Duplicate(boFp32_, 0.0f, bt_ * alignV_);
-        PipeBarrier<PIPE_V>();
-        for (uint32_t r = 0; r < curBT; ++r) {
-            const uint32_t qRowOff = r * alignK_;
-            const uint32_t oRowOff = r * alignV_;
-            for (uint32_t kk = 0; kk < k_; ++kk) {
-                const float qScalar = qFp32_.GetValue(qRowOff + kk);
-                // b_o[r, :] += qScalar * H[kk, :]
-                // Encoded as: tmp = H[kk, :] * qScalar; b_o[r, :] += tmp.
-                // We re-use rowAcc_ (alignV_ floats) as the tmp slot.
-                Muls(rowAcc_, hFp32_[kk * alignV_], qScalar, alignV_);
-                PipeBarrier<PIPE_V>();
-                Add(boFp32_[oRowOff], boFp32_[oRowOff], rowAcc_, alignV_);
-                PipeBarrier<PIPE_V>();
-            }
-        }
+        DataCopyPadExtParams<ACC_T> pad{
+            true, 0, static_cast<uint8_t>(alignBT_ - curBT), 0,
+        };
+        LocalTensor<ACC_T> g = gQue_.AllocTensor<ACC_T>();
+        DataCopyPad(g, gGm_[off], params, pad);
+        gQue_.EnQue<ACC_T>(g);
+        return gQue_.DeQue<ACC_T>();
     }
 
     /*!
-     * \brief Compute b_A = Q_t @ K_t^T  (shape [BT, alignBT]).
+     * \brief Apply gate decay (if any) and the within-chunk causal mask.
      *
-     * For each (i, j) pair within the chunk:
-     *   b_A[i, j] = <Q_t[i, :], K_t[j, :]>
-     * We implement it as an outer-product accumulation similar to ComputeQH:
-     *   for k in [0, K): b_A += Q_t[:, k] * K_t[:, k] (broadcast pattern)
-     * We pre-compute Q_t[:, k] (BT scalars) once per k and update each row.
-     * Total elementary ops: BT * BT * K. With BT=64, K=128 that is 524288
-     * fp32 FMAs spread across 64 rows; the inner Axpy length is alignBT (= 64).
+     * For our half (rows in [rowOff_, rowOff_+myRows)):
+     *   c1[r, :] *= exp(g[rowOff_+r])
+     *   c2[r, j] *= safe_exp(g[rowOff_+r] - g[j])     for j in [0, BT)
+     *   c2[r, j]  = 0                                 for j > rowOff_+r
      */
-    __aicore__ inline void ComputeQKt(uint32_t curBT) {
-        // For row i: b_A[i, j] = <Q_t[i, :], K_t[j, :]>
-        //                     = sum_k Q_t[i, k] * K_t[j, k]
-        // Implementation: accumulate per (i, j) pair as a true scalar inner
-        // product. The vector-style approach here would require a transpose
-        // of K (since K_t[j, k] with j varying has stride alignK_). For the
-        // AIV reference impl we use the explicit scalar loop; the cube path
-        // documented in the design doc replaces it with a single Mmad.
-        for (uint32_t i = 0; i < curBT; ++i) {
-            const uint32_t qRowOff = i * alignK_;
-            const uint32_t aRowOff = i * alignBT_;
-            for (uint32_t j = 0; j < curBT; ++j) {
-                const uint32_t kRowOff = j * alignK_;
-                float acc = 0.0f;
-                for (uint32_t kk = 0; kk < k_; ++kk) {
-                    acc += qFp32_.GetValue(qRowOff + kk)
-                         * kFp32_.GetValue(kRowOff + kk);
-                }
-                bAFp32_.SetValue(aRowOff + j, acc);
+    __aicore__ inline void ApplyGatingAndMask(LocalTensor<ACC_T> &c1,
+                                              LocalTensor<ACC_T> &c2,
+                                              LocalTensor<ACC_T> &g,
+                                              uint32_t myRows,
+                                              uint32_t curBT) {
+        if (useG_) {
+            // Pre-compute exp(g) for all BT positions (c1 row scaling needs
+            // exp(g[globalR]) and c2 row scaling needs g[globalR] - g[j]).
+            Exp(gExp_, g, alignBT_);
+            PipeBarrier<PIPE_V>();
+
+            for (uint32_t r = 0; r < myRows; ++r) {
+                const uint32_t globalR = rowOff_ + r;
+                // c1[r,:] *= exp(g[globalR])
+                const ACC_T expGr = gExp_.GetValue(globalR);
+                Muls(c1[r * alignV_], c1[r * alignV_], expGr, alignV_);
+
+                // diff[j] = g[globalR] - g[j], clamp positives to 0 so that
+                // exp(diff) on the upper-triangular region yields 1 (which
+                // we then mask away). The lower-triangular region holds the
+                // real safe_exp factor.
+                const ACC_T gR = g.GetValue(globalR);
+                Adds(diff_, g, -gR, alignBT_);                  // g - gR
+                PipeBarrier<PIPE_V>();
+                Muls(diff_, diff_, ACC_T(-1), alignBT_);        // gR - g
+                PipeBarrier<PIPE_V>();
+                Mins(diff_, diff_, ACC_T(0), alignBT_);         // safe clamp
+                PipeBarrier<PIPE_V>();
+                Exp(diff_, diff_, alignBT_);
+                PipeBarrier<PIPE_V>();
+                Mul(c2[r * alignBT_], c2[r * alignBT_], diff_, alignBT_);
+                PipeBarrier<PIPE_V>();
+            }
+        }
+
+        // Causal mask: zero c2[r, j] for j > rowOff_+r so that the cube MM3
+        // sees a strictly lower-triangular b_A_masked.
+        for (uint32_t r = 0; r < myRows; ++r) {
+            const uint32_t globalR = rowOff_ + r;
+            const uint32_t keep = (globalR + 1 <= alignBT_) ? (globalR + 1) : alignBT_;
+            const uint32_t zeroLen = alignBT_ - keep;
+            if (zeroLen > 0) {
+                Duplicate(c2[r * alignBT_ + keep], ACC_T(0), zeroLen);
             }
         }
         PipeBarrier<PIPE_V>();
     }
-
-    __aicore__ inline void FreeAfterCompute() {
-        // q/k/v/h queues already freed inside CopyIn*. Nothing to do here.
-        // Placeholder kept for future double-buffered prefetching.
-    }
-
-    // ------------------------------------------------------------------
-    // Step 4: gating
-    // ------------------------------------------------------------------
 
     /*!
-     * \brief Apply gate decay to b_o and b_A.
-     *
-     * For inter-chunk b_o: multiply each row r by exp(g[r]).
-     * For intra-chunk b_A: multiply entry (i, j) by safe_exp(g[i] - g[j]).
-     * safe_exp(x) := exp(x) for x <= 0, else 0. Implemented as:
-     *   safe_exp(x) = (x > 0) ? 0 : exp(x)
-     * which avoids overflow in the upper-triangular region (which is later
-     * masked out anyway).
+     * \brief Cast c2 (fp32, masked) -> b_A_masked (bf16) and write to
+     *        workspace. The fp32 buffer `c2` is left intact for the caller
+     *        to free.
      */
-    __aicore__ inline void ApplyGating(uint32_t curBT, uint32_t curBV) {
-        // gExp_[r] = exp(g[r])
-        Exp(gExp_, gFp32_, alignBT_);
-        PipeBarrier<PIPE_V>();
+    __aicore__ inline void CastAndStoreAmask(LocalTensor<ACC_T> &c2,
+                                             uint64_t wsByteOff,
+                                             uint32_t myRows) {
+        LocalTensor<IN_T> am = amQue_.AllocTensor<IN_T>();
+        Cast(am, c2, RoundMode::CAST_RINT, myRows * alignBT_);
+        amQue_.EnQue<IN_T>(am);
+        am = amQue_.DeQue<IN_T>();
 
-        // b_o[r, :] *= gExp_[r]    (broadcast over V)
-        for (uint32_t r = 0; r < curBT; ++r) {
-            const float scalar = gExp_.GetValue(r);
-            Muls(boFp32_[r * alignV_], boFp32_[r * alignV_], scalar, alignV_);
-        }
-        PipeBarrier<PIPE_V>();
+        const uint64_t rowOffBytes = (uint64_t)rowOff_ * alignBT_ * sizeof(IN_T);
+        __gm__ IN_T *dst = reinterpret_cast<__gm__ IN_T *>(
+            wsGm_.GetPhyAddr() + wsByteOff + rowOffBytes);
+        GlobalTensor<IN_T> dstGm;
+        dstGm.SetGlobalBuffer(dst);
 
-        // b_A[i, j] *= safe_exp(g[i] - g[j])
-        for (uint32_t i = 0; i < curBT; ++i) {
-            const float gi = gFp32_.GetValue(i);
-            for (uint32_t j = 0; j < curBT; ++j) {
-                const float diff = gi - gFp32_.GetValue(j);
-                const float factor = (diff > 0.0f) ? 0.0f
-                                                   : ScalarExp(diff);
-                const float prev = bAFp32_.GetValue(i * alignBT_ + j);
-                bAFp32_.SetValue(i * alignBT_ + j, prev * factor);
-            }
-        }
-        PipeBarrier<PIPE_V>();
+        DataCopyExtParams params{
+            static_cast<uint16_t>(myRows),
+            static_cast<uint32_t>(alignBT_ * sizeof(IN_T)),
+            0, 0, 0,
+        };
+        DataCopyPad(dstGm, am, params);
+        amQue_.FreeTensor(am);
     }
 
-    // ------------------------------------------------------------------
-    // Step 5 & 6: causal mask and combine
-    // ------------------------------------------------------------------
-
-    __aicore__ inline void ApplyCausalMaskAndCombine(uint32_t curBT,
-                                                     uint32_t curBV) {
-        // Step 5: causal mask. Set b_A[i, j] = 0 for j > i.
-        for (uint32_t i = 0; i < curBT; ++i) {
-            for (uint32_t j = i + 1; j < curBT; ++j) {
-                bAFp32_.SetValue(i * alignBT_ + j, 0.0f);
-            }
-        }
+    /*!
+     * \brief Combine c1 + c3 with scale, cast to bf16 and store to o_gm.
+     *        The caller frees c1 and c3.
+     */
+    __aicore__ inline void ComposeAndStore(LocalTensor<ACC_T> &c1,
+                                           LocalTensor<ACC_T> &c3,
+                                           uint32_t globalToken, uint32_t hIdx,
+                                           uint32_t vStart, uint32_t curBV,
+                                           uint32_t myRows) {
+        const uint32_t cnt = myRows * alignV_;
+        // boFp_ = scale * c1
+        Muls(boFp_, c1, scale_, cnt);
+        PipeBarrier<PIPE_V>();
+        // c3 = scale * c3 (in-place to save a temp)
+        Muls(c3, c3, scale_, cnt);
+        PipeBarrier<PIPE_V>();
+        // boFp_ += c3
+        Add(boFp_, boFp_, c3, cnt);
         PipeBarrier<PIPE_V>();
 
-        // Step 6: b_o = scale * b_o + scale * (b_A @ V_t)
-        //       (the second term is computed as outer-product accumulation
-        //        across the BT reduction dim of b_A)
-        // First, scale b_o.
-        Muls(boFp32_, boFp32_, scale_, bt_ * alignV_);
-        PipeBarrier<PIPE_V>();
+        // Cast bf16 and store.
+        LocalTensor<IN_T> outLocal = outQue_.AllocTensor<IN_T>();
+        Cast(outLocal, boFp_, RoundMode::CAST_RINT, cnt);
+        outQue_.EnQue<IN_T>(outLocal);
+        outLocal = outQue_.DeQue<IN_T>();
 
-        // Now accumulate scale * (b_A @ V_t) into b_o.
-        // For row i we sweep j in [0, i] (the masked region) and add
-        //   (scale * b_A[i, j]) * V_t[j, :]
-        // We use Muls(rowAcc_) + Add(boFp32_) for each (i, j) pair.
-        for (uint32_t i = 0; i < curBT; ++i) {
-            const uint32_t boRowOff = i * alignV_;
-            const uint32_t aRowOff  = i * alignBT_;
-            for (uint32_t j = 0; j <= i; ++j) {
-                const float aij = bAFp32_.GetValue(aRowOff + j);
-                if (aij == 0.0f) {
-                    continue;
-                }
-                Muls(rowAcc_, vFp32_[j * alignV_], scale_ * aij, alignV_);
-                PipeBarrier<PIPE_V>();
-                Add(boFp32_[boRowOff], boFp32_[boRowOff], rowAcc_, alignV_);
-                PipeBarrier<PIPE_V>();
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Step 7: cast to bf16 and store back
-    // ------------------------------------------------------------------
-
-    __aicore__ inline void CastAndStoreOut(uint32_t globalToken, uint32_t hIdx,
-                                           uint32_t vStart, uint32_t curBT,
-                                           uint32_t curBV) {
-        LocalTensor<IN_T> outLocal = outQueue_.AllocTensor<IN_T>();
-        Cast(outLocal, boFp32_, RoundMode::CAST_RINT, bt_ * alignV_);
-        outQueue_.EnQue<IN_T>(outLocal);
-        outLocal = outQueue_.DeQue<IN_T>();
-
-        const uint64_t outBase = (uint64_t)globalToken * h_ * v_
-                               + (uint64_t)hIdx * v_
-                               + vStart;
-        DataCopyExtParams oParams{
-            static_cast<uint16_t>(curBT),
+        const uint64_t outBase = (uint64_t)(globalToken + rowOff_) * h_ * v_
+                               + (uint64_t)hIdx * v_ + vStart;
+        // For the store we have alignV per row in UB but only curBV are valid;
+        // dstStride between consecutive token rows is (h_*v_ - curBV) bytes.
+        DataCopyExtParams params{
+            static_cast<uint16_t>(myRows),
             static_cast<uint32_t>(curBV * sizeof(IN_T)),
-            0,                                                       // srcStride blocks (UB src is row-packed)
-            static_cast<uint32_t>((h_ * v_ - curBV) * sizeof(IN_T)), // dstStride bytes
+            static_cast<uint32_t>(((alignV_ - curBV) * sizeof(IN_T)) / BF16_PER_BLOCK),
+            static_cast<uint32_t>((h_ * v_ - curBV) * sizeof(IN_T)),
             0,
         };
-        DataCopyPad(outGm_[outBase], outLocal, oParams);
-        outQueue_.FreeTensor(outLocal);
+        DataCopyPad(outGm_[outBase], outLocal, params);
+        outQue_.FreeTensor(outLocal);
     }
 
-    // ------------------------------------------------------------------
-    // Misc helpers
-    // ------------------------------------------------------------------
-
-    /*!
-     * \brief Scalar exp; on AIV we have to use the IRS exponent unit. AscendC
-     *        does not expose a stand-alone scalar exp, so emulate with a
-     *        1-element vector exp via a tiny scratch slot. We reuse rowAcc_[0].
-     */
-    __aicore__ inline float ScalarExp(float x) {
-        rowAcc_.SetValue(0, x);
-        Exp(rowAcc_, rowAcc_, FP32_PER_BLOCK);
-        PipeBarrier<PIPE_V>();
-        return rowAcc_.GetValue(0);
-    }
-
-    // ---- TilingData fields (cached) ---------------------------------------
+    // ---- Cached TilingData ------------------------------------------------
     uint32_t b_{0}, tMax_{0}, hg_{0}, h_{0}, k_{0}, v_{0}, bt_{0}, bv_{0};
-    uint32_t numVTile_{0}, numCores_{0};
-    uint32_t alignK_{0}, alignV_{0}, alignBT_{0};
-    uint32_t groupSize_{1};
-    bool useG_{false}, isVarlen_{false};
-    float scale_{1.0f};
-    int32_t blockIdx_{0};
+    uint32_t numVTile_{0}, aicNum_{0};
+    uint32_t alignK_{0}, alignV_{0}, alignBT_{0}, groupSize_{1};
+    bool     useG_{false}, isVarlen_{false};
+    ACC_T    scale_{1.0f};
+    uint32_t wsBytesC1_{0}, wsBytesC2_{0}, wsBytesAmaskBf16_{0}, wsBytesC3_{0};
+    uint32_t wsBytesPerSlot_{0}, wsBytesPerUnit_{0};
 
-    // Per-batch running state.
-    uint32_t bohN_{0};
-    uint32_t curNidxForG_{0};
-    uint32_t curBosForG_{0};
+    int32_t  aivIdx_{0}, aicIdx_{0};
+    uint32_t subBlock_{0};        // 0 (upper rows) or 1 (lower rows)
+    uint32_t halfBT_{0};
+    uint32_t rowOff_{0};          // first BT row this AIV handles
+    uint32_t rowsThis_{0};        // rows owned (when curBT == bt_)
+    uint32_t curNidx_{0}, curBos_{0};
 
-    // ---- GlobalTensors ----------------------------------------------------
-    GlobalTensor<IN_T>     qGm_;
-    GlobalTensor<IN_T>     kGm_;
-    GlobalTensor<IN_T>     vGm_;
-    GlobalTensor<HSTATE_T> hGm_;
+    // c1 is dequeued before MASK_DONE and held until MM3_DONE so we can use
+    // it in the combine step without an extra GM round-trip.
+    LocalTensor<ACC_T> heldC1_;
+    bool               heldC1Valid_{false};
+
     GlobalTensor<float>    gGm_;
     GlobalTensor<int32_t>  cuSeqlensGm_;
     GlobalTensor<int32_t>  chunkOffsetsGm_;
     GlobalTensor<IN_T>     outGm_;
+    GlobalTensor<uint8_t>  wsGm_;
 
-    // ---- TPipe & queues ---------------------------------------------------
     TPipe *pipe_{nullptr};
-    TQue<QuePosition::VECIN,  QUEUE_DEPTH>     qInQueue_;
-    TQue<QuePosition::VECIN,  QUEUE_DEPTH>     kInQueue_;
-    TQue<QuePosition::VECIN,  QUEUE_DEPTH>     vInQueue_;
-    TQue<QuePosition::VECIN,  QUEUE_DEPTH>     hInQueue_;
-    TQue<QuePosition::VECIN,  QUEUE_DEPTH>     gInQueue_;
-    TQue<QuePosition::VECOUT, OUT_QUEUE_DEPTH> outQueue_;
+    TQue<QuePosition::VECIN,  1> c1Que_;
+    TQue<QuePosition::VECIN,  1> c2Que_;
+    TQue<QuePosition::VECIN,  1> c3Que_;
+    TQue<QuePosition::VECIN,  1> gQue_;
+    TQue<QuePosition::VECIN,  1> amQue_;   // bf16 cast buffer en route to ws
+    TQue<QuePosition::VECOUT, 2> outQue_;  // double-buffered final store
 
-    // ---- Scratch (TBuf) and slices ----------------------------------------
     TBuf<TPosition::VECCALC> scratch_;
-    LocalTensor<float> boFp32_;
-    LocalTensor<float> bAFp32_;
-    LocalTensor<float> qFp32_;
-    LocalTensor<float> kFp32_;
-    LocalTensor<float> vFp32_;
-    LocalTensor<float> hFp32_;
-    LocalTensor<float> gFp32_;
-    LocalTensor<float> gExp_;
-    LocalTensor<float> rowAcc_;
+    LocalTensor<ACC_T> gExp_;
+    LocalTensor<ACC_T> diff_;
+    LocalTensor<ACC_T> boFp_;
+    LocalTensor<ACC_T> rowAcc_;
 };
 
 }  // namespace ChunkGatedDeltaRuleO

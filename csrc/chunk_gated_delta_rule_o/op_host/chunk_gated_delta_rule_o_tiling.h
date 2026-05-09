@@ -9,7 +9,7 @@
 
 /*!
  * \file chunk_gated_delta_rule_o_tiling.h
- * \brief Host tiling for ChunkGatedDeltaRuleO.
+ * \brief Host tiling for ChunkGatedDeltaRuleO (AIC + AIV mix mode).
  */
 
 #ifndef OP_HOST_CHUNK_GATED_DELTA_RULE_O_TILING_H
@@ -19,6 +19,7 @@
 #include "register/tilingdata_base.h"
 #include "tiling_base.h"
 #include "error_log.h"
+#include "tiling/platform/platform_ascendc.h"
 #include "../op_kernel/chunk_gated_delta_rule_o_tiling_data.h"
 
 namespace optiling {
@@ -27,7 +28,13 @@ using namespace ChunkGatedDeltaRuleO;
 
 struct ChunkGatedDeltaRuleOCompileInfo {
     uint64_t aivNum{0UL};
+    uint64_t aicNum{0UL};
     uint64_t ubSize{0UL};
+    uint64_t l1Size{0UL};
+    uint64_t l0aSize{0UL};
+    uint64_t l0bSize{0UL};
+    uint64_t l0cSize{0UL};
+    platform_ascendc::SocVersion socVersion{platform_ascendc::SocVersion::ASCEND910B};
 };
 
 struct ChunkGatedDeltaRuleOInfo {
@@ -62,7 +69,9 @@ private:
     ge::graphStatus GetScale();
     ge::graphStatus GetChunkSize();
     ge::graphStatus DetectOptionalInputs();
-    ge::graphStatus PlanBlockDim();
+    void PlanBlockDim();
+    void PlanWorkspaceLayout();
+    ge::graphStatus ConfigMatmulTilings();
 
     ChunkGatedDeltaRuleOCompileInfo compileInfo_;
     ChunkGatedDeltaRuleOTilingData  tilingData_{};

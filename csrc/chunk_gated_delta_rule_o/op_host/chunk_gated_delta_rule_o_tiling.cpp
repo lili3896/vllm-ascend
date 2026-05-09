@@ -9,28 +9,22 @@
 
 /*!
  * \file chunk_gated_delta_rule_o_tiling.cpp
- * \brief Host tiling for ChunkGatedDeltaRuleO.
+ * \brief Host tiling for ChunkGatedDeltaRuleO (AIC + AIV mix mode).
  *
- * Steps (TilingBaseClass framework):
- *   1. GetPlatformInfo (no-op; queried already in InitCompileInfo)
- *   2. GetShapeAttrsInfo:
- *        - Analyse input dtypes (must be bf16 / fp32 / int32)
- *        - Analyse input shapes and fill TilingData scalars
- *        - Read scale_value attr and chunk_size attr
- *        - Detect optional g / cu_seqlens / chunk_offsets presence
- *   3. DoOpTiling:
- *        - PlanBlockDim: pick block dim = min(aivNum, N*H*numVTile)
- *   4. DoLibApiTiling: trivial (we don't use Matmul tiling API in this AIV-only
- *      kernel; reserved for the future cube path)
- *   5. GetTilingKey: a single key today; combine USE_G/IS_VARLEN bits when the
- *      cube path lands.
- *   6. GetWorkspaceSize: 16MiB system workspace as required by the runtime.
- *   7. PostTiling: serialise TilingData blob and set block dim.
+ * Tiling responsibilities:
+ *   1. Validate inputs (dtype, rank, GQA constraints).
+ *   2. Pick block_dim equal to min(units, aicNum) where
+ *      units = N * H * ceil(V / B_V).
+ *   3. Build three TCubeTiling structures via matmul_tiling::MultiCoreMatmulTiling
+ *      for the three MMAs (Q@H, Q@K^T, A_masked @ V).
+ *   4. Plan the per-work-unit ping-pong workspace and total workspace bytes.
  */
 
 #include "chunk_gated_delta_rule_o_tiling.h"
 
 #include <array>
+#include <algorithm>
+#include "tiling/tiling_api.h"
 #include "tiling_templates_registry.h"
 #include "register/op_def_registry.h"
 #include "platform/platform_infos_def.h"
@@ -58,19 +52,14 @@ constexpr uint32_t DEFAULT_BT = 64;
 constexpr uint32_t DEFAULT_BV = 64;
 constexpr uint32_t MAX_K_HEAD_DIM = 256;
 constexpr uint32_t MAX_V_HEAD_DIM = 256;
-
-constexpr uint32_t BF16_BLOCK_ELEMS = 16;  // 32B / 2B
-constexpr uint32_t FP32_BLOCK_ELEMS = 8;   // 32B / 4B
-
-template <typename T>
-T CeilDiv(T a, T b) {
-    return (b == 0) ? T(0) : T((a + b - 1) / b);
-}
+constexpr uint32_t CUBE_BLOCK = 16;     // 16x16x16 fundamental cube tile
+constexpr uint32_t FP32_BLOCK = 8;
+constexpr uint32_t BF16_BLOCK = 16;
 
 template <typename T>
-T CeilAlign(T a, T b) {
-    return CeilDiv(a, b) * b;
-}
+T CeilDiv(T a, T b) { return (b == 0) ? T(0) : T((a + b - 1) / b); }
+template <typename T>
+T CeilAlign(T a, T b) { return CeilDiv(a, b) * b; }
 
 }  // namespace
 
@@ -84,15 +73,21 @@ void ChunkGatedDeltaRuleOTiling::InitCompileInfo() {
         OP_LOGE(context_->GetNodeName(), "platformInfoPtr is null");
         return;
     }
-    const auto &platform = platform_ascendc::PlatformAscendC(platformInfoPtr);
-    platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB,
-                            compileInfo_.ubSize);
+    auto platform = platform_ascendc::PlatformAscendC(platformInfoPtr);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB,    compileInfo_.ubSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L1,    compileInfo_.l1Size);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A,  compileInfo_.l0aSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B,  compileInfo_.l0bSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C,  compileInfo_.l0cSize);
     compileInfo_.aivNum = platform.GetCoreNumAiv();
-    if (compileInfo_.aivNum == 0) {
-        OP_LOGE(context_->GetNodeName(), "aivNum is zero");
+    compileInfo_.aicNum = platform.GetCoreNumAic();
+    compileInfo_.socVersion = platform.GetSocVersion();
+    if (compileInfo_.aicNum == 0 || compileInfo_.aivNum == 0) {
+        OP_LOGE(context_->GetNodeName(), "aicNum/aivNum is zero");
         return;
     }
-    tilingData_.numCores = static_cast<uint32_t>(compileInfo_.aivNum);
+    tilingData_.aicNum = static_cast<uint32_t>(compileInfo_.aicNum);
+    tilingData_.aivNum = static_cast<uint32_t>(compileInfo_.aivNum);
 }
 
 ge::graphStatus ChunkGatedDeltaRuleOTiling::GetPlatformInfo() {
@@ -230,7 +225,16 @@ ge::graphStatus ChunkGatedDeltaRuleOTiling::GetChunkSize() {
                         "chunk_size must be in (0, 128], got %ld", bt),
                 return ge::GRAPH_FAILED);
     tilingData_.bt = static_cast<uint32_t>(bt);
-    tilingData_.bv = DEFAULT_BV;
+
+    // Choose B_V as the largest power-of-2 tile that divides V and is in
+    // [16, 128]. For typical Qwen3-Next (V=128) we get bv=128 (1 V-tile);
+    // for V=256 we get bv=128 (2 V-tiles). Falls back to 64 otherwise.
+    uint32_t bv = 128;
+    while (bv > 16 && tilingData_.v % bv != 0) {
+        bv >>= 1;
+    }
+    if (bv < 16) bv = DEFAULT_BV;
+    tilingData_.bv = bv;
     tilingData_.numVTile = CeilDiv(tilingData_.v, tilingData_.bv);
     return ge::GRAPH_SUCCESS;
 }
@@ -246,43 +250,128 @@ ge::graphStatus ChunkGatedDeltaRuleOTiling::DetectOptionalInputs() {
 // ---------------------------------------------------------------------------
 
 ge::graphStatus ChunkGatedDeltaRuleOTiling::DoOpTiling() {
-    return PlanBlockDim();
+    PlanBlockDim();
+    PlanWorkspaceLayout();
+    return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus ChunkGatedDeltaRuleOTiling::PlanBlockDim() {
-    tilingData_.alignK  = CeilAlign(tilingData_.k, BF16_BLOCK_ELEMS);
-    tilingData_.alignV  = CeilAlign(tilingData_.bv, BF16_BLOCK_ELEMS);
-    tilingData_.alignBT = CeilAlign(tilingData_.bt, FP32_BLOCK_ELEMS);
+void ChunkGatedDeltaRuleOTiling::PlanBlockDim() {
+    tilingData_.alignK  = CeilAlign(tilingData_.k,  CUBE_BLOCK);
+    tilingData_.alignV  = CeilAlign(tilingData_.bv, CUBE_BLOCK);
+    tilingData_.alignBT = CeilAlign(tilingData_.bt, CUBE_BLOCK);
 
     const uint64_t units = static_cast<uint64_t>(tilingData_.b)
                          * tilingData_.h
                          * tilingData_.numVTile;
-    uint64_t cores = (compileInfo_.aivNum > 0) ? compileInfo_.aivNum : 1;
-    if (units < cores) {
-        cores = units == 0 ? 1 : units;
-    }
-    tilingData_.numCores = static_cast<uint32_t>(cores);
-    PrintTilingData();
-    return ge::GRAPH_SUCCESS;
+    uint64_t aicNum = (compileInfo_.aicNum > 0) ? compileInfo_.aicNum : 1;
+    if (units < aicNum) aicNum = (units == 0) ? 1 : units;
+    tilingData_.aicNum = static_cast<uint32_t>(aicNum);
+    tilingData_.aivNum = static_cast<uint32_t>(aicNum * 2);  // 1 AIC : 2 AIVs
+}
+
+void ChunkGatedDeltaRuleOTiling::PlanWorkspaceLayout() {
+    tilingData_.wsBytesC1        = tilingData_.bt * tilingData_.alignV * sizeof(float);
+    tilingData_.wsBytesC2        = tilingData_.bt * tilingData_.alignBT * sizeof(float);
+    tilingData_.wsBytesAmaskBf16 = tilingData_.bt * tilingData_.alignBT * sizeof(uint16_t);
+    tilingData_.wsBytesC3        = tilingData_.bt * tilingData_.alignV * sizeof(float);
+    tilingData_.wsBytesPerSlot   = tilingData_.wsBytesC1 + tilingData_.wsBytesC2
+                                 + tilingData_.wsBytesAmaskBf16 + tilingData_.wsBytesC3;
+    tilingData_.wsBytesPerUnit   = 2u * tilingData_.wsBytesPerSlot;  // ping-pong
 }
 
 ge::graphStatus ChunkGatedDeltaRuleOTiling::DoLibApiTiling() {
-    tilingKey_ = 0;
+    return ConfigMatmulTilings();
+}
+
+ge::graphStatus ChunkGatedDeltaRuleOTiling::ConfigMatmulTilings() {
+    // Build platform info passthrough for the matmul tiling helper.
+    matmul_tiling::PlatformInfo platformInfo;
+    platformInfo.socVersion = compileInfo_.socVersion;
+    platformInfo.l1Size     = compileInfo_.l1Size;
+    platformInfo.l0CSize    = compileInfo_.l0cSize;
+    platformInfo.ubSize     = compileInfo_.ubSize;
+    platformInfo.l0ASize    = compileInfo_.l0aSize;
+    platformInfo.l0BSize    = compileInfo_.l0bSize;
+
+    const auto bf16 = matmul_tiling::DataType::DT_BFLOAT16;
+    const auto fp32 = matmul_tiling::DataType::DT_FLOAT;
+
+    // -------- MM1 : Q [BT, K] x H [K, BV] -> c1 [BT, BV] (fp32 accum) ----
+    {
+        matmul_tiling::MultiCoreMatmulTiling mm(platformInfo);
+        mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, bf16, false);
+        mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, bf16, false);
+        mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, fp32);
+        mm.SetOrgShape(tilingData_.bt, tilingData_.bv, tilingData_.k);
+        mm.SetShape(tilingData_.bt, tilingData_.bv, tilingData_.k);
+        mm.SetFixSplit(tilingData_.bt, tilingData_.bv, tilingData_.k);
+        mm.SetBufferSpace(compileInfo_.l1Size, compileInfo_.l0cSize, compileInfo_.ubSize);
+        if (mm.GetTiling(tilingData_.mm1Tiling) == -1) {
+            OP_LOGE(context_->GetNodeName(), "mm1 tiling failed.");
+            return ge::GRAPH_FAILED;
+        }
+    }
+
+    // -------- MM2 : Q [BT, K] x K^T [K, BT] -> c2 [BT, BT] ---------------
+    {
+        matmul_tiling::MultiCoreMatmulTiling mm(platformInfo);
+        mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, bf16, false);
+        // transposeB=true so the cube reads K row-major and treats it as K^T
+        mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, bf16, true);
+        mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, fp32);
+        mm.SetOrgShape(tilingData_.bt, tilingData_.bt, tilingData_.k);
+        mm.SetShape(tilingData_.bt, tilingData_.bt, tilingData_.k);
+        mm.SetFixSplit(tilingData_.bt, tilingData_.bt, tilingData_.k);
+        mm.SetBufferSpace(compileInfo_.l1Size, compileInfo_.l0cSize, compileInfo_.ubSize);
+        if (mm.GetTiling(tilingData_.mm2Tiling) == -1) {
+            OP_LOGE(context_->GetNodeName(), "mm2 tiling failed.");
+            return ge::GRAPH_FAILED;
+        }
+    }
+
+    // -------- MM3 : A_masked [BT, BT] x V [BT, BV] -> c3 [BT, BV] -------
+    {
+        matmul_tiling::MultiCoreMatmulTiling mm(platformInfo);
+        mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, bf16, false);
+        mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, bf16, false);
+        mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, fp32);
+        mm.SetOrgShape(tilingData_.bt, tilingData_.bv, tilingData_.bt);
+        mm.SetShape(tilingData_.bt, tilingData_.bv, tilingData_.bt);
+        mm.SetFixSplit(tilingData_.bt, tilingData_.bv, tilingData_.bt);
+        mm.SetBufferSpace(compileInfo_.l1Size, compileInfo_.l0cSize, compileInfo_.ubSize);
+        if (mm.GetTiling(tilingData_.mm3Tiling) == -1) {
+            OP_LOGE(context_->GetNodeName(), "mm3 tiling failed.");
+            return ge::GRAPH_FAILED;
+        }
+    }
     return ge::GRAPH_SUCCESS;
 }
 
 uint64_t ChunkGatedDeltaRuleOTiling::GetTilingKey() const {
-    return tilingKey_;
+    // bit 0: USE_G, bit 1: IS_VARLEN; reserved for future template specialisations
+    uint64_t key = 0;
+    if (tilingData_.useG)     key |= 1ULL;
+    if (tilingData_.isVarlen) key |= (1ULL << 1);
+    return key;
 }
 
 ge::graphStatus ChunkGatedDeltaRuleOTiling::GetWorkspaceSize() {
+    // System-side workspace + per-work-unit ping-pong slots.
     constexpr uint64_t SYS_WORKSPACE = 16ULL * 1024 * 1024;
-    workspaceSize_ = SYS_WORKSPACE;
+    auto platform = platform_ascendc::PlatformAscendC(context_->GetPlatformInfo());
+    uint64_t libApi = static_cast<uint64_t>(platform.GetLibApiWorkSpaceSize());
+    const uint64_t units = static_cast<uint64_t>(tilingData_.b)
+                         * tilingData_.h
+                         * tilingData_.numVTile;
+    workspaceSize_ = SYS_WORKSPACE + libApi
+                   + units * tilingData_.wsBytesPerUnit;
     return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus ChunkGatedDeltaRuleOTiling::PostTiling() {
-    context_->SetBlockDim(tilingData_.numCores);
+    // For mix mode, the runtime expects block_dim measured in AIC count.
+    context_->SetBlockDim(tilingData_.aicNum);
+
     auto blob = context_->GetRawTilingData();
     OP_CHECK_NULL_WITH_CONTEXT(context_, blob);
     const auto sz = sizeof(ChunkGatedDeltaRuleOTilingData);
@@ -298,20 +387,21 @@ ge::graphStatus ChunkGatedDeltaRuleOTiling::PostTiling() {
     size_t *workspaces = context_->GetWorkspaceSizes(1);
     OP_CHECK_NULL_WITH_CONTEXT(context_, workspaces);
     workspaces[0] = workspaceSize_;
+    PrintTilingData();
     return ge::GRAPH_SUCCESS;
 }
 
 void ChunkGatedDeltaRuleOTiling::PrintTilingData() const {
     OP_LOGD(context_->GetNodeName(),
             "tiling: b=%u t=%u hg=%u h=%u k=%u v=%u bt=%u bv=%u "
-            "numVTile=%u numCores=%u useG=%u isVarlen=%u "
-            "alignK=%u alignV=%u alignBT=%u scale=%f",
+            "numVTile=%u aicNum=%u aivNum=%u useG=%u isVarlen=%u "
+            "alignK=%u alignV=%u alignBT=%u scale=%f wsPerUnit=%u",
             tilingData_.b, tilingData_.t, tilingData_.hg, tilingData_.h,
             tilingData_.k, tilingData_.v, tilingData_.bt, tilingData_.bv,
-            tilingData_.numVTile, tilingData_.numCores,
+            tilingData_.numVTile, tilingData_.aicNum, tilingData_.aivNum,
             tilingData_.useG, tilingData_.isVarlen,
             tilingData_.alignK, tilingData_.alignV, tilingData_.alignBT,
-            tilingData_.scale);
+            tilingData_.scale, tilingData_.wsBytesPerUnit);
 }
 
 // ---------------------------------------------------------------------------
