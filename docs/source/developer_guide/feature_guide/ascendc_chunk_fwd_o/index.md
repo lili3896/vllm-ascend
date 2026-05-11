@@ -588,3 +588,225 @@ flowchart LR
 
 > 若个别版本的 Excalidraw 暂不支持 `gantt`，可使用其它 `flowchart` /
 > `sequenceDiagram` 图，它们是 Excalidraw 长期稳定支持的语法。
+
+---
+
+## 13. 对比章节：triton 版 `chunk_o.py` 的数据流水
+
+本节用与 §12 完全相同的算例（`B=2, T=512, H=4, Hg=4, K=128, V=128, BT=64,
+BK=128, BV=128, bf16`）跟踪 `vllm_ascend/ops/triton/fla/chunk_o.py` 中
+`chunk_fwd_kernel_o` 的执行过程，方便和 §12 的 AscendC 实现对照。
+
+> 关键事实：triton 是面向 GPU 的"单 program / 单线程块"编程模型。在
+> vLLM Ascend 上 `tl.dot` 与 `tl.load/tl.store` 会经 triton→NPU 编译路径
+> 全部 lower 到 **AIV(Vector) 单元**，cube 单元完全不参与。
+
+### 13.1 Python 入口流程
+
+```mermaid
+flowchart TD
+    A["chunk_fwd_o(q, k, v, h, g, scale, cu_seqlens, chunk_size, chunk_offsets)"]
+    A --> B["B, T, Hg, K = q.shape<br/>H, V = v.shape[-2:]<br/>BT = chunk_size = 64"]
+    B --> C{"scale is None?"}
+    C -->|是| C1["scale = K ** -0.5 = 1/sqrt(128) ≈ 0.0884"]
+    C -->|否| C2["保持用户传入"]
+    C1 --> D["o = torch.empty_like(v)"]
+    C2 --> D
+    D --> E{"cu_seqlens is None?"}
+    E -->|是 fixed-shape| E1["N = B = 2<br/>chunk_offsets = None"]
+    E -->|否 varlen| E2["N = len(cu_seqlens)-1<br/>chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)"]
+    E1 --> F["g = g.transpose(1,2).contiguous() → (B, H, T)"]
+    E2 --> F
+    F --> G["grid(meta) = (cdiv(V, meta['BV']), N * H) = (1, 8)"]
+    G --> H["chunk_fwd_kernel_o[grid]<br/>BT=64, BK=128, BV=128<br/>num_warps=4, num_stages=2"]
+    H --> I["JIT 编译 → 8 个 triton program"]
+```
+
+* **`scale = K^-0.5` 默认值**：与标准 attention 缩放保持一致。
+* **`g.transpose(1, 2).contiguous()`**：kernel 内按"先 head 后 time"线性
+  索引 g（`g_ptr = g + bos + i_h * T_max`），host 必须先把 `(B, T, H)` 转
+  成 `(B, H, T)` 并连续化，否则 stride 不匹配。每次调用都会有一次显式
+  transpose 开销，这是 triton 版的代价之一。
+* **`grid = (BVN, N*H)`**：让每个 program 唯一占有一个
+  `(i_v, batch, head)` 三元组；`V` 用 `BV` 切块从而支持任意 V。
+* **`prepare_chunk_offsets`** 在 host 端预计算 h 张量中每个序列的起始
+  chunk 索引，避免 device 端再做前缀和。
+
+### 13.2 单个 program 的工作
+
+```mermaid
+flowchart TD
+    P["program (i_v, i_nh)<br/>i_v ∈ [0, BVN), i_nh ∈ [0, N*H)"]
+    P --> Q["i_n = i_nh // H<br/>i_h = i_nh % H<br/>(本例 i_v=0, 共 8 个 program 覆盖 N*H=8)"]
+    Q --> R{"IS_VARLEN?"}
+    R -->|是| S1["bos = cu_seqlens[i_n]<br/>eos = cu_seqlens[i_n+1]<br/>T = eos - bos<br/>NT = cdiv(T, BT)<br/>boh = chunk_offsets[i_n]"]
+    R -->|否| S2["bos = i_n*T = 0<br/>eos = bos+T = 512<br/>NT = cdiv(T, BT) = 8<br/>boh = i_n*NT = 0"]
+    S1 --> U["指针一次性偏移:<br/>q += (bos*Hg + i_h//(H/Hg)) * K<br/>k += (bos*Hg + i_h//(H/Hg)) * K<br/>v += (bos*H + i_h) * V<br/>o += (bos*H + i_h) * V"]
+    S2 --> U
+    U --> V["for i_t in range(NT):  # 串行处理 8 个 chunk"]
+    V --> W["chunk 内部计算 (见 §13.3)"]
+    W --> X{"i_t 是否到达 NT?"}
+    X -->|否| V
+    X -->|是| Y["program 退出"]
+```
+
+* **`i_h // (H // Hg)`** 实现 KV grouped attention：多个 q-head 共享同一
+  份 k-head；本例 `Hg = H`，分组系数为 1，不影响计算。
+* **指针在循环外一次性偏移**：让编译器把 `(bos, i_h)` 相关的乘法消去，
+  循环体内只剩与 `i_t * BT` 相关的偏移，降低寄存器压力。
+* **同一 program 串行所有 chunk**：与 AscendC 版的多核 chunk 串行不同，
+  这里完全没有跨核并行，**8 个 chunk 全部跑在同一个 AIV 上**。
+
+### 13.3 单个 chunk 的内部计算
+
+```mermaid
+flowchart TD
+    A["chunk t 入口（i_t）"]
+    A --> B["b_o = zeros[BT, BV] fp32<br/>b_A = zeros[BT, BT] fp32<br/>(累加寄存器，常驻 SRAM/UB)"]
+    B --> C["i_tg = boh + i_t<br/>h_base = h + (i_tg*H + i_h) * K * V"]
+    C --> D{"i_k loop: 0..cdiv(K, BK)<br/>本例 K=128, BK=128 → 只 1 次"}
+    D --> E["block_ptr 三件:<br/>p_q (T,K) 取 [i_t*BT, i_k*BK]+(BT,BK)<br/>p_k (K,T) 取 [i_k*BK, i_t*BT]+(BK,BT)  ← 转置视图<br/>p_h (K,V) 取 [i_k*BK, i_v*BV]+(BK,BV)"]
+    E --> F["b_q = tl.load(p_q, bcheck) [BT,BK]<br/>b_k = tl.load(p_k, bcheck) [BK,BT]<br/>b_h = tl.load(p_h, bcheck) [BK,BV]"]
+    F --> G["b_o += tl.dot(b_q, b_h)   # [BT,BV] fp32 累加<br/>b_A += tl.dot(b_q, b_k)   # [BT,BT] fp32 累加"]
+    G --> H{"i_k 还有下一块?"}
+    H -->|是| D
+    H -->|否| I{"USE_G?"}
+    I -->|是| J["offs_t = i_t*BT + arange(0, BT)<br/>mask_t = offs_t < T<br/>b_g = tl.load(g + bos + i_h*T_max + offs_t, mask)<br/>b_o = b_o * exp(b_g)[:, None]<br/>b_A = b_A * safe_exp(b_g[:,None] - b_g[None,:])"]
+    I -->|否| K["跳过"]
+    J --> L["因果 mask (强制下三角):<br/>o_i = arange(0, BT)<br/>m_A = o_i[:,None] >= o_i[None,:]<br/>b_A = tl.where(m_A, b_A, 0)"]
+    K --> L
+    L --> M["p_v / p_o block_ptr<br/>b_v = tl.load(p_v, bcheck) [BT, BV]"]
+    M --> N["b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale"]
+    N --> O["tl.store(p_o, b_o.to(p_o.dtype.element_ty), bcheck)"]
+    O --> P[chunk 结束]
+```
+
+逐步原理：
+
+* **`tl.zeros` 累加器** 会被编译器分配在 SRAM（NPU 上对应 UB），所有后续
+  `tl.dot` 都对同一块内存原位累加；fp32 累加避免连续 reduce 时的精度
+  坍塌。
+* **`tl.make_block_ptr` 表达子块**：base + shape + stride + offset +
+  block + order 一次性声明给编译器。`p_k` 的 shape `(K, T)`、stride
+  `(1, Hg*K)` 是对 `k` 的转置视图，**无需在 GM 上真的转置就能让
+  `tl.dot(b_q, b_k)` 等价于 `Q · K^T`**，省一次显存重写。
+  `boundary_check=(0, 1)` 让编译器在尾部 chunk 不足 BT 时自动 mask，
+  避免越界。
+* **`tl.dot(b_q, b_h)` / `tl.dot(b_q, b_k)`**：GPU 上对应 Tensor Core；
+  NPU triton 编译路径中这些 `tl.dot` 会被 lower 到 AIV 上的向量 GEMM
+  ——这是 triton 版最大的性能短板：本应跑在 ~256 TFLOPS cube 上的算子
+  被压在 ~8 TFLOPS 向量单元上。
+* **K 方向的 `i_k` 循环** 本例 K=128, BK=128 只跑 1 次；对更大 K（例如
+  256）就会切成多块、增量累加，累加器始终留在 SRAM。
+* **`USE_G` 分支**：
+  * `b_g` 长度 BT，越界 0；
+  * `b_o *= exp(b_g)[:, None]` 按行缩放 inter-chunk 输出；
+  * `b_A *= safe_exp(b_g[:,None] - b_g[None,:])`，`safe_exp(x) =
+    exp(where(x<=0, x, -inf))`，**上三角 `g_i - g_j > 0` 处直接 0**，
+    把因果性提前烧进得分矩阵。
+* **`m_A = o_i[:,None] >= o_i[None,:]`** 再做一次纯因果 mask 兜底：当
+  `USE_G=False` 时 `b_A` 还未因果化，此步负责清零上三角。
+* **`b_o = b_o * scale + tl.dot(b_A.to(bf16), b_v) * scale`**：
+  * `b_A` cast 回 bf16 是为了让 `tl.dot` 接受 GPU Tensor Core / NPU 向量
+    GEMM 要求的低精度输入；
+  * 两个 `* scale` 等价把 `Q · scale` 提前融进 GEMM 的累加路径里，省一
+    次广播乘法。
+* **`tl.store(..., bcheck=(0,1))`** cast 回 bf16 写回 GM；尾部 chunk
+  自动 mask 写入位置。
+
+### 13.4 数据走向
+
+```mermaid
+flowchart LR
+    subgraph GM["GM 全局内存"]
+        gQ["q [T, Hg, K] bf16"]
+        gK["k [T, Hg, K] bf16"]
+        gV["v [T, H, V] bf16"]
+        gH["h [NT_tot, H, K, V] bf16"]
+        gG["g.T (B,H,T) fp32"]
+        gO["o [T, H, V] bf16"]
+    end
+    subgraph UB["UB / SRAM (单个 program 私有)"]
+        sQ["b_q bf16 [BT, BK]"]
+        sK["b_k bf16 [BK, BT]"]
+        sH["b_h bf16 [BK, BV]"]
+        sV["b_v bf16 [BT, BV]"]
+        sG["b_g fp32 [BT]"]
+    end
+    subgraph ACC["fp32 累加器（驻 UB / 寄存器）"]
+        aO["b_o [BT, BV]"]
+        aA["b_A [BT, BT]"]
+    end
+    gQ -- "tl.load" --> sQ
+    gK -- "tl.load 转置视图" --> sK
+    gH -- "tl.load" --> sH
+    gV -- "tl.load" --> sV
+    gG -- "tl.load mask" --> sG
+    sQ -. "tl.dot(b_q,b_h)" .-> aO
+    sH -. "tl.dot(b_q,b_h)" .-> aO
+    sQ -. "tl.dot(b_q,b_k)" .-> aA
+    sK -. "tl.dot(b_q,b_k)" .-> aA
+    sG -. "* exp(b_g)[:,None]" .-> aO
+    sG -. "* safe_exp(diff)" .-> aA
+    aA -. "where(causal)" .-> aA
+    aA -. "cast bf16 + tl.dot" .-> aO
+    sV -. ".. * b_v" .-> aO
+    aO -- "cast bf16, tl.store" --> gO
+```
+
+* **没有 workspace**：与 AscendC 版本不同，triton 不需要在 GM 上中转
+  cube 结果——所有中间矩阵 `b_o`、`b_A` 都活在 SRAM/UB 中。
+* **`k` 通过 stride trick 实现转置**：GM 上不重写，只是 block_ptr 的
+  shape/stride 反过来声明。
+* **`b_o`/`b_A` 是 fp32**，写出之前才 cast 回 bf16，保证累加路径数值
+  稳定。
+* **`b_A → bf16 → tl.dot(b_A, b_v)` 的精度跳变**：是 `tl.dot` 接口的
+  必要妥协。
+
+### 13.5 单 program 内的串行时序
+
+```mermaid
+gantt
+    dateFormat  X
+    axisFormat  %s
+    title 一个 triton program 串行处理 NT 个 chunk（无 cube/vector 并行）
+
+    section program
+    load Q/K/H#0    :a0, 0, 5
+    tl.dot QH/QK#0  :b0, 5, 25
+    apply g#0       :c0, 25, 27
+    causal mask#0   :d0, 27, 28
+    load V#0        :e0, 28, 30
+    tl.dot A@V + fuse#0 :f0, 30, 45
+    cast+store O#0  :g0, 45, 47
+
+    load Q/K/H#1    :a1, 47, 52
+    tl.dot QH/QK#1  :b1, 52, 72
+    apply g#1       :c1, 72, 74
+    causal mask#1   :d1, 74, 75
+    load V#1        :e1, 75, 77
+    tl.dot A@V + fuse#1 :f1, 77, 92
+    cast+store O#1  :g1, 92, 94
+```
+
+* **整条流水都在一个 AIV 上**——无 AIC，所有 `tl.dot` 退化为 vector GEMM。
+* `num_stages=2` 在 triton 里指 K loop 软件 pipelining 两级：编译器让下
+  一轮 `tl.load` 与本轮 `tl.dot` 并发，**但只在 K loop 内有效**。本例
+  K=128, BK=128 时 K loop 只跑一次，软件 pipeline 几乎无收益。
+* `num_warps=4` 在 GPU 上表示 4 个 warp 协同；在 NPU 上对应单个 AIV
+  内的 thread/vector slot 数。
+
+### 13.6 与 AscendC 版本对比
+
+| 维度 | triton 版 (`chunk_o.py`) | AscendC 版 (`csrc/chunk_fwd_o`) |
+| --- | --- | --- |
+| 并发模型 | 单 program 串行整个 NT 循环 | 多 AIC，每 AIC 串行其任务的 NT 循环；AIC↔AIV 双流水 |
+| 矩阵乘执行 | `tl.dot` → AIV 向量单元（~8 TFLOPS） | `Matmul` API → AIC cube 单元（~256 TFLOPS） |
+| Cube 利用率 | 0% | ~95%（除短暂 `wait AV`） |
+| 中间结果 | `b_o`/`b_A` 常驻 SRAM/UB | 通过 GM `hWS / attnWS / vWS / amWS` 中转 cube↔vector |
+| 因果 mask | 每 chunk 用 `arange` 重新生成 | kernel 启动期常量化在 UB，所有 chunk 共享 |
+| 同步 | 无（单 program 顺序执行） | 5 个 `CrossCoreSetFlag/WaitFlag` 跨核同步 |
+| `k` 转置 | block_ptr stride trick | `SetTensorB(k, transpose=true)`，cube ND→NZ 时完成 |
+| 软件流水 | `num_stages=2`（K loop 内层） | AIC/AIV 双流水 + chunk 间 NEXT 流水 |
+| 写回 | `tl.store` + `boundary_check` | `DataCopyPad` 带 stride (H·V − BV) |
+| 适合场景 | 算法快速迭代、原型验证 | 生产部署、高吞吐场景 |
