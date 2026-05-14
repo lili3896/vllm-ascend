@@ -18,7 +18,7 @@ at::Tensor npu_chunk_fwd_o(
     const at::Tensor& h,
     const c10::optional<at::Tensor>& g,
     const at::Tensor& cu_seqlens,
-    const at::Tensor& chunk_offsets,
+    const at::Tensor& chunk_indices,
     double scale,
     int64_t chunk_size)
 {
@@ -32,7 +32,7 @@ at::Tensor npu_chunk_fwd_o(
                  h,
                  g,
                  cu_seqlens,
-                 chunk_offsets,
+                 chunk_indices,
                  scale_real,
                  chunk_size,
                  output);

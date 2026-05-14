@@ -1,5 +1,27 @@
 # ChunkFwdO AscendC 算子设计文档
 
+> **本算子版本：** Ping-Pong 双缓冲 + CV 融合软件流水（`PING_PONG_STAGES = 2`，
+> `KERNEL_TYPE_MIX_AIC_1_2`，三个高阶 Matmul + 两阶段 Vec）。
+>
+> **参考的代码仓与算子骨架：**
+>
+> * [cann/cannbot-skills](https://gitcode.com/cann/cannbot-skills) — AscendC
+>   算子开发的 skill 集合，本算子的 host tiling 模板、错误处理宏、双
+>   段式 aclnn 接口骨架直接复用其约定。
+> * [cann/ops-transformer](https://gitcode.com/cann/ops-transformer) —
+>   `lightning_indexer`、`sparse_flash_attention` 等 transformer 类算子
+>   均采用"Cube 计算下放 AIC + 向量后处理在 AIV"的范式，本算子的
+>   `Matmul<...>` 三件套类型定义、`SetTensorA / SetTensorB / SetTail /
+>   IterateAll` 调用顺序、`REGIST_MATMUL_OBJ` 注册流程参考自其中。
+> * [cann/ops-sparse](https://gitcode.com/cann/ops-sparse) — sparse 场景
+>   的 ping-pong 双缓冲与 `CrossCoreSetFlag / WaitFlag` 范式，本算子的
+>   `BlockSchedulerGdnFwdOCube/Vec` 即按 `currStage - 1` / `currStage - 2`
+>   的 ping-pong 调度法移植而来。
+> * [vllm-project/flash-linear-attention](https://github.com/vllm-project/vllm)
+>   中的 [`vllm_ascend/ops/triton/fla/chunk_o.py`](../../../../vllm_ascend/ops/triton/fla/chunk_o.py)
+>   — 数值参考与 host 端 `chunk_indices / cu_seqlens` 的构造规则与之
+>   完全一致。
+
 本文档描述 `ChunkFwdO` 的 AscendC 实现。该算子用于
 Flash-Linear-Attention（FLA）系列模型（Gated DeltaNet、RWKV-7 等）的
 chunk 前向输出计算，是 vLLM Ascend 中 FLA 流水的关键性能算子。
@@ -1102,3 +1124,174 @@ flowchart LR
 
 * 三次矩阵乘（①、②、⑤）是算力主要来源；
 * 四次点乘（③a、③b、④、⑥）只占很少计算量但缺一不可。
+
+---
+
+## 15. 形参表（与对外 OpDef 一致）
+
+| 算子名称 | 字段分组 | 字段名 | 参数描述 | 可选/必选 | 字段类型 | 数据类型 | 默认值 | Format | shape | 值域 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **ChunkFwdO** | INPUT | `q` | attention 中的查询向量 | 必选 | tensor | bf16 |   | ND | `[B, T, Hg, D]` | 典型：[-1,1]；泛化 L1 |
+|  | INPUT | `k` | attention 中的键向量 | 必选 | tensor | bf16 |   | ND | `[B, T, Hg, D]` | 典型：[-1,1]；泛化 L1 |
+|  | INPUT | `v` | attention 中的值向量 | 必选 | tensor | bf16 |   | ND | `[B, H, T, D]` | 典型：[-50,50]；泛化 L1 |
+|  | INPUT | `h` | 每个序列每个 chunk 的隐状态，是 GDN 的核心状态变量 | 必选 | tensor | bf16 |   | ND | `[B, H, NT, D, D]` | 典型：[-100,100]；泛化 L1 |
+|  | INPUT | `g` | 门控参数；累积门控衰减，T 维 chunk 内严格递减且为负。算子外由 [B,T,H] 转置得到 | 必选 | tensor | fp32 |   | ND | `[B, H, T]` | 测试给定生成方式 |
+|  | INPUT | `scale` | 注意力缩放系数 | 可选 | float | float 标量 | `1.0 / sqrt(D)` |   |   |   |
+|  | INPUT | `cu_seqlens` | 变长场景下每个序列的累积长度，用于按序列切分扁平化的 q/k/v | 必选 | tensor | int64 |   | ND | `[N+1]` | 递增序列，0 ~ T |
+|  | INPUT | `chunk_indices` | chunk 索引表，变长场景下定位每个 chunk 的所属序列与序列内序号；第一列 = chunk 所属序列 id，第二列 = chunk 在序列内的 id | 必选 | tensor | int64 |   | ND | `[NT, 2]` | 全 0 tensor（按规则填充） |
+|  | ATTR | `chunk_size` | T 轴切分的 chunk 大小，当前仅支持 64 | 必选 | int | int64 | 64 |   |   | 64 |
+|  | OUTPUT | `o` | 最终注意力输出 | 必选 | tensor | bf16 |   | ND | `[B, H, T, D]` |   |
+
+> 备注：本算子在 host 端只接受 `chunk_size = 64`（与 triton 参考实现的硬编码一致），
+> 其它取值会在 tiling 阶段返回 `GRAPH_FAILED`。
+
+---
+
+## 16. Ping-Pong 双缓冲 + CV 融合软件流水（本版本核心改动）
+
+本版本算子在原有 1 AIC + 2 AIV 混合模板上引入了显式的 **PING-PONG
+双缓冲**与**软件流水**，把每个 task 拆成两阶段：
+
+* **Phase A**：`Cube1 (Q@K^T) → Vec1 (Apply G + Causal Mask)`
+* **Phase B**：`Cube2/3 (Q@H + Attn@V) → Vec2 (融合输出 O)`
+
+两阶段使用不同的 ping-pong 缓冲，从而在同一主循环迭代里可以并发执行
+"上一任务的 Phase B" 与 "本任务的 Phase A"。
+
+### 16.1 调度器伪代码
+
+```cpp
+constexpr uint32_t PING_PONG_STAGES = 2;
+
+// Cube 调度器：直接用 GetBlockIdx() 的全局索引
+struct BlockSchedulerGdnFwdOCube {
+    // 获取 Cube1 使用的偏移（当前阶段最新算出的那份）
+    GDNFwdOOffsets& GetCube1Offsets() {
+        return offsets[(currStage - 1) % PING_PONG_STAGES];
+    }
+    // 获取 Cube2/3 使用的偏移（上一轮算好的那份）
+    GDNFwdOOffsets& GetCube23Offsets() {
+        return offsets[(currStage - 2) % PING_PONG_STAGES];
+    }
+};
+
+// Vec 调度器：同一个 AIC 下的多个 AIV 共享同一组任务，
+// 通过 GetBlockIdx() / GetSubBlockNum() 合并索引按行拆分 BT。
+struct BlockSchedulerGdnFwdOVec {
+    GDNFwdOOffsets& GetVec1Offsets() {
+        return offsets[(currStage - 1) % PING_PONG_STAGES];
+    }
+    GDNFwdOOffsets& GetVec2Offsets() {
+        return offsets[(currStage - 2) % PING_PONG_STAGES];
+    }
+};
+```
+
+实际实现位于 `csrc/chunk_fwd_o/op_kernel/chunk_fwd_o.h` 中
+`ChunkFwdOAIC::Process()` / `ChunkFwdOAIV::Process()`，主循环：
+
+```cpp
+for (int64_t s = 1; s <= taskCount + 1; ++s) {
+    int64_t taskNew = s - 1;   // Phase A 任务
+    int64_t taskOld = s - 2;   // Phase B 任务
+    int64_t bufNew  = taskNew % PING_PONG_STAGES;
+    int64_t bufOld  = taskOld >= 0 ? taskOld % PING_PONG_STAGES : 0;
+
+    // Phase A：Cube1 → SetFlag(CUBE1_DONE[bufNew])
+    //          AIV 端 WaitFlag(CUBE1_DONE[bufNew]) → Vec1 → SetFlag(VEC1_DONE[bufNew])
+
+    // Phase B：AIC 端 WaitFlag(VEC1_DONE[bufOld]) → Cube2/Cube3 → SetFlag(CUBE23_DONE[bufOld])
+    //          AIV 端 WaitFlag(CUBE23_DONE[bufOld]) → Vec2 → SetFlag(VEC2_DONE[bufOld])
+}
+```
+
+### 16.2 任务划分公式
+
+```
+vLoops      = ceil(V / BV)
+shapeBatch  = B
+numChunks   = NT_per_batch  (h 张量的第 3 维)
+vNumHead    = H
+taskNum     = vLoops × shapeBatch × numChunks × vNumHead
+```
+
+* **Cube 调度器（AIC）：** 直接用 `GetBlockIdx()` 取本核任务区间
+  `[taskNum * blockId / numAic, taskNum * (blockId + 1) / numAic)`，
+  每个 AIC 独立完成自己范围内的所有 Phase A + Phase B。
+* **Vec 调度器（AIV）：** 同一个 AIC 配对的两个 AIV 使用相同的
+  `GetBlockIdx()`（即同一个任务区间），并通过
+  `subId = GetSubBlockIdx()` / `subNum = GetSubBlockNum()` 把每个 task
+  的 BT 行拆为 `[BT*subId/subNum, BT*(subId+1)/subNum)`，两个 AIV
+  分时复用同一组 ping-pong 缓冲。
+
+### 16.3 跨核同步标志
+
+实现使用 6 组 flag（每组 2 个，ping/pong 各一个）：
+
+| flag                  | 生产者 | 消费者 | 含义                                             |
+| --------------------- | ----- | ----- | ------------------------------------------------ |
+| `CUBE1_DONE[buf]`     | AIC   | AIV   | `Q@K^T` 已写入 `attnWs[buf]`                      |
+| `VEC1_DONE[buf]`      | AIV   | AIC   | `Apply G + Mask` 已写入 `amWs[buf]`，且 attnWs 可复用 |
+| `CUBE23_DONE[buf]`    | AIC   | AIV   | `Q@H` 写入 `hWs[buf]`，`Attn@V` 写入 `vWs[buf]`     |
+| `VEC2_DONE[buf]`      | AIV   | AIC   | 融合输出 `O` 已写回，hWs / vWs 可复用             |
+
+`CUBE1_DONE / CUBE23_DONE` 使用 `PIPE_FIX` 触发；`VEC1_DONE / VEC2_DONE`
+使用 `PIPE_MTE3` 触发。`<2, ...>` 模板参数表示"两个配对 AIV 都置位
+后下游才放行"，避免漏掉子核的部分写入。
+
+### 16.4 时序图
+
+```mermaid
+sequenceDiagram
+    participant Cube as Cube (AIC)
+    participant Vec as Vec (AIV)
+    participant Flag as CrossCoreFlag
+
+    Note over Cube, Vec: 第一轮迭代
+    Cube->>Cube: Cube1: Q×K^T → Attn[buf=0]
+    Cube->>Flag: SetFlag(CUBE1_DONE[0])
+    Flag-->>Vec: 置位
+    Vec->>Vec: Vec1: Apply G + Mask, 写 amWs[0]
+    Vec->>Flag: SetFlag(VEC1_DONE[0])
+
+    Note over Cube, Vec: 第二轮迭代（依赖上一轮 Vec1）
+    Cube->>Flag: WaitFlag(VEC1_DONE[0])
+    Cube->>Cube: Cube2: Q×H → hWs[0]
+    Cube->>Cube: Cube3: Attn×V → vWs[0]
+    Cube->>Flag: SetFlag(CUBE23_DONE[0])
+
+    Note over Cube, Vec: 与此同时：Phase A 在 buf=1 上进行
+    Cube->>Cube: Cube1: Q×K^T → Attn[buf=1]
+    Cube->>Flag: SetFlag(CUBE1_DONE[1])
+    Vec->>Vec: Vec1: Apply G + Mask, 写 amWs[1]
+    Vec->>Flag: SetFlag(VEC1_DONE[1])
+
+    Note over Cube, Vec: Vec 拿到 Cube23 done 后做 Vec2
+    Flag-->>Vec: CUBE23_DONE[0] 置位
+    Vec->>Flag: WaitFlag(CUBE23_DONE[0])
+    Vec->>Vec: Vec2: 融合输出 O[0]
+    Vec->>Flag: SetFlag(VEC2_DONE[0])
+
+    Note over Cube, Vec: 后续迭代继续 ping-pong 交错
+```
+
+### 16.5 关键修复（与上一版的差异）
+
+* **修复 Matmul API 用法**：`mmQK.SetTensorA(reinterpret_cast<__gm__ Q_T*>(q) + qOffset, false)`
+  在 AscendC 高阶 Matmul API 中无匹配重载。本版本统一改为
+  `mmQK.SetTensorA(qGm[qOffset], false)`，其中 `qGm` 是事先用
+  `qGm.SetGlobalBuffer(reinterpret_cast<__gm__ Q_T*>(q))` 初始化的
+  `GlobalTensor<Q_T>`；`IterateAll` 同理改为
+  `mmQK.IterateAll(attnWsGm[buf], 0)`。
+* **修正 h 形状**：从原先的 `[NT_total, H, D, D]` 改为参数表要求的
+  `[B, H, NT, D, D]`，对应偏移
+  `hOffset = i_h * NT * K * V + i_tg * K * V + i_v * BV`。
+* **修正 v / o 形状**：与参数表一致 `[B, H, T, D]`，偏移
+  `vOffset = oOffset = i_h * T * V + (bos + i_t * BT) * V + i_v * BV`。
+* **`chunk_offsets` → `chunk_indices`**：第二列改为存 chunk-in-seq id，
+  整体 shape `[NT, 2]`，与参数表一致。kernel 通过
+  `chunk_indices[i_tg, :]` 一次读出 `(i_n, i_t)`。
+* **`taskNum`** 显式存入 tiling，并在 device 端用 `GetBlockIdx()` 划分
+  任务区间。Vec 端用 `GetBlockIdx()` × `GetSubBlockNum()` +
+  `GetSubBlockIdx()` 合并索引，按 `BT` 行二分。
+

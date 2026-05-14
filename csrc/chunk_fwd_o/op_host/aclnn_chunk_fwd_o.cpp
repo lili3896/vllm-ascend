@@ -33,7 +33,7 @@ static const std::initializer_list<op::DataType> SEQ_DT  = {op::DataType::DT_INT
 // 入参合法性校验：必选 tensor 非空、各 tensor dtype 在支持范围内。
 static bool CheckParams(const aclTensor* q, const aclTensor* k, const aclTensor* v,
                         const aclTensor* h, const aclTensor* g,
-                        const aclTensor* cuSeqlens, const aclTensor* chunkOffsets,
+                        const aclTensor* cuSeqlens, const aclTensor* chunkIndices,
                         const aclTensor* o)
 {
     OP_CHECK_NULL(q, return false);
@@ -41,7 +41,7 @@ static bool CheckParams(const aclTensor* q, const aclTensor* k, const aclTensor*
     OP_CHECK_NULL(v, return false);
     OP_CHECK_NULL(h, return false);
     OP_CHECK_NULL(cuSeqlens, return false);
-    OP_CHECK_NULL(chunkOffsets, return false);
+    OP_CHECK_NULL(chunkIndices, return false);
     OP_CHECK_NULL(o, return false);
 
     OP_CHECK_DTYPE_NOT_SUPPORT(q, QKV_DT, return false);
@@ -50,7 +50,7 @@ static bool CheckParams(const aclTensor* q, const aclTensor* k, const aclTensor*
     OP_CHECK_DTYPE_NOT_SUPPORT(h, QKV_DT, return false);
     OP_CHECK_DTYPE_NOT_SUPPORT(o, QKV_DT, return false);
     OP_CHECK_DTYPE_NOT_SUPPORT(cuSeqlens, SEQ_DT, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(chunkOffsets, SEQ_DT, return false);
+    OP_CHECK_DTYPE_NOT_SUPPORT(chunkIndices, SEQ_DT, return false);
     if (g != nullptr) {
         OP_CHECK_DTYPE_NOT_SUPPORT(g, G_DT, return false);
     }
@@ -61,18 +61,18 @@ static bool CheckParams(const aclTensor* q, const aclTensor* k, const aclTensor*
 
 aclnnStatus aclnnChunkFwdOGetWorkspaceSize(const aclTensor* q, const aclTensor* k, const aclTensor* v,
                                            const aclTensor* h, const aclTensor* g,
-                                           const aclTensor* cuSeqlens, const aclTensor* chunkOffsets,
+                                           const aclTensor* cuSeqlens, const aclTensor* chunkIndices,
                                            float scale, int64_t chunkSize,
                                            aclTensor* o, uint64_t* workspaceSize, aclOpExecutor** executor)
 {
     L2_DFX_PHASE_1(aclnnChunkFwdO,
-                   DFX_IN(q, k, v, h, g, cuSeqlens, chunkOffsets, scale, chunkSize),
+                   DFX_IN(q, k, v, h, g, cuSeqlens, chunkIndices, scale, chunkSize),
                    DFX_OUT(o));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
-    CHECK_RET(CheckParams(q, k, v, h, g, cuSeqlens, chunkOffsets, o), ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(CheckParams(q, k, v, h, g, cuSeqlens, chunkIndices, o), ACLNN_ERR_PARAM_INVALID);
 
     // 把所有输入转成连续布局，避免 kernel 内部需要处理 stride。
     auto qC  = l0op::Contiguous(q,  uniqueExecutor.get());
@@ -80,14 +80,14 @@ aclnnStatus aclnnChunkFwdOGetWorkspaceSize(const aclTensor* q, const aclTensor* 
     auto vC  = l0op::Contiguous(v,  uniqueExecutor.get());
     auto hC  = l0op::Contiguous(h,  uniqueExecutor.get());
     auto cuC = l0op::Contiguous(cuSeqlens, uniqueExecutor.get());
-    auto coC = l0op::Contiguous(chunkOffsets, uniqueExecutor.get());
+    auto ciC = l0op::Contiguous(chunkIndices, uniqueExecutor.get());
     const aclTensor* gC = nullptr;
     if (g != nullptr) {
         gC = l0op::Contiguous(g, uniqueExecutor.get());
     }
 
     // 调用 L0 接口，加入 launcher。
-    auto outRet = l0op::ChunkFwdO(qC, kC, vC, hC, gC, cuC, coC, scale, chunkSize, uniqueExecutor.get());
+    auto outRet = l0op::ChunkFwdO(qC, kC, vC, hC, gC, cuC, ciC, scale, chunkSize, uniqueExecutor.get());
     CHECK_RET(outRet != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
     auto out_ = l0op::Contiguous(o, uniqueExecutor.get());

@@ -9,16 +9,12 @@
 
 /*!
  * \file chunk_fwd_o_tiling_data.h
- * \brief ChunkFwdO 算子在 host 与 device 端共享的 tiling 数据结构定义。
+ * \brief ChunkFwdO 算子在 host 与 device 端共享的 tiling 数据结构。
  *
- *  ChunkFwdO 计算 FLA（Flash-Linear-Attention）前向 chunk 切分的输出，
- *  数学行为与 vllm_ascend 中 triton 版本
- *  vllm_ascend/ops/triton/fla/chunk_o.py 完全一致：
- *
- *      o = (Q @ H) * exp(g) * scale + (causal_mask(Q @ K) * exp(g_i - g_j)) @ V * scale
- *
- *  完整的设计文档参见：
- *  docs/source/developer_guide/feature_guide/ascendc_chunk_fwd_o
+ *  本实现采用 1 AIC + 2 AIV 的 CV 融合模式，配合 PING_PONG_STAGES = 2 的
+ *  双缓冲软件流水：Cube 调度器与 Vec 调度器各持一份 offsets[2]，分别在
+ *  `currStage-1` 与 `currStage-2` 上读取，实现 Cube1/Cube23 与 Vec1/Vec2
+ *  的 4 段交错。
  */
 
 #ifndef CHUNK_FWD_O_TILING_DATA_H
@@ -28,40 +24,42 @@
 
 namespace ChunkFwdO {
 
-// 算子使用的 chunk 大小及 K/V 方向的内层块大小（与 triton 版默认一致）。
-constexpr uint32_t CHUNK_FWD_O_BT = 64;          // 单个 chunk 包含的 token 数 BT
-constexpr uint32_t CHUNK_FWD_O_BK = 128;         // K 方向的内层块大小
-constexpr uint32_t CHUNK_FWD_O_BV = 128;         // V 方向的内层块大小
+// chunk 算法常量（与 triton 参考实现一致）
+constexpr uint32_t CHUNK_FWD_O_BT = 64;          // 单 chunk 的 token 数
+constexpr uint32_t CHUNK_FWD_O_BV = 128;         // V 方向块大小
 
-// dataType 字段编码（由 host 端 tiling 写入，device 端 dispatch 时使用）
+// 数据类型编码
 constexpr uint32_t CHUNK_FWD_O_DTYPE_BF16 = 0;
 constexpr uint32_t CHUNK_FWD_O_DTYPE_FP16 = 1;
 
+// 双缓冲阶段数（PING / PONG）
+constexpr uint32_t PING_PONG_STAGES = 2;
+
 #pragma pack(push, 8)
 struct alignas(8) ChunkFwdOTilingData {
-    int64_t shapeBatch;                 // N，输入序列条数
-    int64_t seqlen;                     // T，固定 shape 模式下的序列最大长度
-    int64_t kNumHead;                   // Hg，q/k 的 KV 分组头数
-    int64_t vNumHead;                   // H，v/o 的完整头数
-    int64_t kHeadDim;                   // K，每个头的 K 维度
-    int64_t vHeadDim;                   // V，每个头的 V 维度
-    float   scale;                      // attention 缩放系数
-    int64_t chunkSize;                  // BT，chunk 大小
-    int64_t isVariedLen;                // 0 = 固定长度，1 = 启用 cu_seqlens
-    int64_t tokenBatch;                 // varlen 模式下的总 token 数；否则为 N*T
-    int64_t dataType;                   // 0:BF16，1:FP16
-    int64_t totalChunks;                // sum(ceil(seqlen[i]/BT))，对应 h 工作区下标基准
-    int64_t bvNum;                      // ceil(V / BV)
-    int64_t bkNum;                      // ceil(K / BK)
-    int64_t numCubeCore;                // 实际选用的 AIC 核数
-    int64_t numVecCore;                 // 实际选用的 AIV 核数
-    int64_t hasG;                       // 1 表示存在可选输入 g
-    // workspace 内部各缓冲区相对于工作区起始地址的字节偏移。
-    int64_t vWorkspaceOffset;           // (A_masked @ V) 中间结果，fp32
-    int64_t hWorkspaceOffset;           // (Q @ H)        中间结果，fp32
-    int64_t attnWorkspaceOffset;        // (Q @ K) 注意力分数，    fp32
-    int64_t aftermaskWorkspaceOffset;   // 经过 mask 与 g 缩放后的注意力分数，dtype 与输入一致
-    int64_t maskWorkspaceOffset;        // 因果 mask 的设备端缓存（当前实现只在 UB 中保留），fp32
+    int64_t shapeBatch;                 // B：原始 batch 数
+    int64_t seqlen;                     // T：q/k/v/g 中的 T 维（varlen 即 token 总数）
+    int64_t kNumHead;                   // Hg：q/k 头数
+    int64_t vNumHead;                   // H ：v/o/h/g 头数
+    int64_t kHeadDim;                   // D ：q/k head dim（= K）
+    int64_t vHeadDim;                   // D ：v/o head dim（= V）
+    float   scale;                      // 注意力缩放，默认 1/sqrt(D)
+    int64_t chunkSize;                  // BT，仅支持 64
+    int64_t isVariedLen;                // 0=固定 shape，1=cu_seqlens 变长
+    int64_t totalChunks;                // NT：chunk_indices 的行数
+    int64_t numChunks;                  // 单 batch 的最大 chunk 数（h 的第 3 维）
+    int64_t vLoops;                     // ceil(V / BV)
+    int64_t taskNum;                    // vLoops × shapeBatch × numChunks × vNumHead
+    int64_t numCubeCore;                // 实际使用的 AIC 数（= blockDim）
+    int64_t numVecCore;                 // 实际使用的 AIV 数（= 2 × numCubeCore）
+    int64_t dataType;                   // 0:BF16, 1:FP16
+    int64_t hasG;                       // 1=携带 gate g
+    // 各 workspace 段相对工作区起始地址的字节偏移，每段为
+    // numCubeCore × PING_PONG_STAGES × slot_size。
+    int64_t hWorkspaceOffset;           // (Q @ H) 中间结果 fp32
+    int64_t attnWorkspaceOffset;        // (Q @ K^T) 注意力分数 fp32
+    int64_t vWorkspaceOffset;           // (A_masked @ V) 中间结果 fp32
+    int64_t aftermaskWorkspaceOffset;   // 经 mask + g 衰减后的 A，dtype 与输入相同
 };
 #pragma pack(pop)
 

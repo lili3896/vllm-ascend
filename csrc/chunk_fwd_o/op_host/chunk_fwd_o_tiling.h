@@ -9,7 +9,7 @@
 
 /*!
  * \file chunk_fwd_o_tiling.h
- * \brief ChunkFwdO 算子的 host 端 tiling 类声明。
+ * \brief ChunkFwdO 算子的 host tiling 头文件。
  */
 
 #ifndef __OP_HOST_CHUNK_FWD_O_TILING_H__
@@ -33,24 +33,22 @@ TILING_DATA_FIELD_DEF(int64_t, vHeadDim);
 TILING_DATA_FIELD_DEF(float,   scale);
 TILING_DATA_FIELD_DEF(int64_t, chunkSize);
 TILING_DATA_FIELD_DEF(int64_t, isVariedLen);
-TILING_DATA_FIELD_DEF(int64_t, tokenBatch);
-TILING_DATA_FIELD_DEF(int64_t, dataType);
 TILING_DATA_FIELD_DEF(int64_t, totalChunks);
-TILING_DATA_FIELD_DEF(int64_t, bvNum);
-TILING_DATA_FIELD_DEF(int64_t, bkNum);
+TILING_DATA_FIELD_DEF(int64_t, numChunks);
+TILING_DATA_FIELD_DEF(int64_t, vLoops);
+TILING_DATA_FIELD_DEF(int64_t, taskNum);
 TILING_DATA_FIELD_DEF(int64_t, numCubeCore);
 TILING_DATA_FIELD_DEF(int64_t, numVecCore);
+TILING_DATA_FIELD_DEF(int64_t, dataType);
 TILING_DATA_FIELD_DEF(int64_t, hasG);
-TILING_DATA_FIELD_DEF(int64_t, vWorkspaceOffset);
 TILING_DATA_FIELD_DEF(int64_t, hWorkspaceOffset);
 TILING_DATA_FIELD_DEF(int64_t, attnWorkspaceOffset);
+TILING_DATA_FIELD_DEF(int64_t, vWorkspaceOffset);
 TILING_DATA_FIELD_DEF(int64_t, aftermaskWorkspaceOffset);
-TILING_DATA_FIELD_DEF(int64_t, maskWorkspaceOffset);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ChunkFwdO, ChunkFwdOTilingData)
 
-// 编译期从平台信息中拿到的常量，host tiling 计算时会用到。
 struct ChunkFwdOCompileInfo {
     uint64_t aicNum {0};
     uint64_t aivNum {0};
@@ -72,10 +70,7 @@ public:
     ~ChunkFwdOTiling() override = default;
 
 protected:
-    bool IsCapable() override
-    {
-        return true;
-    }
+    bool IsCapable() override { return true; }
     ge::graphStatus GetPlatformInfo() override;
     ge::graphStatus GetShapeAttrsInfo() override;
     ge::graphStatus DoOpTiling() override;

@@ -25,8 +25,9 @@ extern "C" {
  * @param [in] v：数据类型支持 BF16、FLOAT16。
  * @param [in] h：数据类型支持 BF16、FLOAT16，shape 为 (totalChunks, H, K, V)。
  * @param [in] g：可选 gate，数据类型支持 FLOAT32。
- * @param [in] cuSeqlens：累加序列长度，数据类型 INT64。
- * @param [in] chunkOffsets：每个 batch 的 chunk 累加偏移，INT64。
+ * @param [in] cuSeqlens：累加序列长度，shape [N+1] INT64。
+ * @param [in] chunkIndices：chunk 索引表，shape [NT, 2] INT64。
+ *             第一列：chunk 所属序列 id；第二列：chunk 在序列内的 id。
  * @param [in] scale：注意力缩放系数。
  * @param [in] chunkSize：chunk 大小（默认 64）。
  * @param [out] o：输出 tensor，shape/dtype 与 v 一致。
@@ -36,7 +37,7 @@ extern "C" {
  */
 __attribute__((visibility("default"))) aclnnStatus aclnnChunkFwdOGetWorkspaceSize(
     const aclTensor* q, const aclTensor* k, const aclTensor* v, const aclTensor* h,
-    const aclTensor* g, const aclTensor* cuSeqlens, const aclTensor* chunkOffsets,
+    const aclTensor* g, const aclTensor* cuSeqlens, const aclTensor* chunkIndices,
     float scale, int64_t chunkSize,
     aclTensor* o, uint64_t* workspaceSize, aclOpExecutor** executor);
 

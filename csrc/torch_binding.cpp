@@ -1235,7 +1235,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                Tensor h, "
         "                Tensor? g, "
         "                Tensor cu_seqlens, "
-        "                Tensor chunk_offsets, "
+        "                Tensor chunk_indices, "
         "                float scale, "
         "                int chunk_size=64) -> Tensor"
     );

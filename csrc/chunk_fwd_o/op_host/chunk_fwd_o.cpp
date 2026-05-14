@@ -30,11 +30,11 @@ OP_TYPE_REGISTER(ChunkFwdO);
 
 const aclTensor* ChunkFwdO(const aclTensor* q, const aclTensor* k, const aclTensor* v,
                            const aclTensor* h, const aclTensor* g,
-                           const aclTensor* cuSeqlens, const aclTensor* chunkOffsets,
+                           const aclTensor* cuSeqlens, const aclTensor* chunkIndices,
                            float scale, int64_t chunkSize,
                            aclOpExecutor* executor)
 {
-    L0_DFX(ChunkFwdO, q, k, v, h, g, cuSeqlens, chunkOffsets, scale, chunkSize);
+    L0_DFX(ChunkFwdO, q, k, v, h, g, cuSeqlens, chunkIndices, scale, chunkSize);
 
     DataType outType = q->GetDataType();
     Format format = Format::FORMAT_ND;
@@ -43,13 +43,13 @@ const aclTensor* ChunkFwdO(const aclTensor* q, const aclTensor* k, const aclTens
              return nullptr);
 
     auto ret = INFER_SHAPE(ChunkFwdO,
-        OP_INPUT(q, k, v, h, g, cuSeqlens, chunkOffsets),
+        OP_INPUT(q, k, v, h, g, cuSeqlens, chunkIndices),
         OP_OUTPUT(out),
         OP_ATTR(scale, chunkSize));
     OP_CHECK_INFERSHAPE(ret != ACLNN_SUCCESS, return nullptr, "ChunkFwdO InferShape failed.");
 
     ret = ADD_TO_LAUNCHER_LIST_AICORE(ChunkFwdO,
-        OP_INPUT(q, k, v, h, g, cuSeqlens, chunkOffsets),
+        OP_INPUT(q, k, v, h, g, cuSeqlens, chunkIndices),
         OP_OUTPUT(out),
         OP_ATTR(scale, chunkSize));
     OP_CHECK_ADD_TO_LAUNCHER_LIST_AICORE(ret != ACLNN_SUCCESS, return nullptr,
