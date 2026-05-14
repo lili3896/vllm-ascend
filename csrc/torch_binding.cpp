@@ -44,6 +44,7 @@
 #include "moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 #include "sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
+#include "chunk_fwd_o/chunk_fwd_o_torch_adpt.h"
 #include "causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include <c10/core/Device.h>
@@ -1226,6 +1227,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def("npu_sign_bits_pack(Tensor input, int size) -> Tensor");
     ops.impl("npu_sign_bits_pack", torch::kPrivateUse1, &vllm_ascend::npu_sign_bits_pack);
+
+    ops.def(
+        "npu_chunk_fwd_o(Tensor q, "
+        "                Tensor k, "
+        "                Tensor v, "
+        "                Tensor h, "
+        "                Tensor? g, "
+        "                Tensor cu_seqlens, "
+        "                Tensor chunk_indices, "
+        "                float scale, "
+        "                int chunk_size=64) -> Tensor"
+    );
+    ops.impl("npu_chunk_fwd_o", torch::kPrivateUse1, &vllm_ascend::npu_chunk_fwd_o);
 
     ops.def(
         "transpose_kv_cache_by_block(Tensor[] kCache, Tensor[] vCache, Tensor blockIDs, int blockSize, int headNum, int headDim, int splitNum, int layerNum) -> ()"
