@@ -503,16 +503,17 @@ private:
 
         if (td_->hasG != 0) {
             LocalTensor<float> gVec = gBuf_.Get<float>();
+            LocalTensor<float> gExp = gExpBuf_.Get<float>();
             DataCopy(gVec, gGm_[off.gOffset], AlignUp<uint32_t>(BT, 8));
             SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
             WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
+            Exp(gExp, gVec, AlignUp<uint32_t>(BT, 8));
+            PipeBarrier<PIPE_V>();
 
             uint32_t rowBegin, rowEnd;
             GetRowRange(rowBegin, rowEnd);
             for (uint32_t i = rowBegin; i < rowEnd && i < static_cast<uint32_t>(off.actBT); ++i) {
-                float gi = gVec.GetValue(i);
-                // 用 ScalarExp 保留与 triton 完全一致的 exp 路径
-                float ei = AscendC::ScalarExp<float>(gi);
+                float ei = gExp.GetValue(i);
                 Muls(qh[i * bvAlign], qh[i * bvAlign], ei,
                      static_cast<uint32_t>(off.actBV));
             }
