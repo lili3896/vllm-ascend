@@ -22,8 +22,9 @@ at::Tensor npu_chunk_fwd_o(
     double scale,
     int64_t chunk_size)
 {
-    // 输出 tensor 的 shape/dtype 与 v 一致，由调用方持有所有权。
-    at::Tensor output = at::empty(v.sizes(), v.options());
+    // L0 算子输出布局为 [B,T,H,D]；v 的对外输入布局为 [B,H,T,D]。
+    at::Tensor output = at::empty({q.size(0), q.size(1), v.size(1), v.size(3)},
+                                  v.options().dtype(q.scalar_type()));
     float scale_real = static_cast<float>(scale);
     EXEC_NPU_CMD(aclnnChunkFwdO,
                  q,

@@ -38,7 +38,8 @@ constexpr size_t CHUNK_SIZE_ATTR_INDEX = 1;
 
 constexpr int64_t WORKSPACE_ALIGN = 512;
 constexpr int64_t DEFAULT_BV      = 128;
-constexpr int64_t SUPPORTED_BT    = 64;
+constexpr int64_t MAX_BT          = ::ChunkFwdO::CHUNK_FWD_O_MAX_BT;
+constexpr int64_t BT_ALIGN        = 16;
 
 template <typename T>
 static inline T CeilAlignT(T a, T align)
@@ -128,6 +129,11 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
         // v: [B, H, T, D]
         H = vS.GetDim(1);
         V = vS.GetDim(3);
+        OP_CHECK_IF(vS.GetDim(0) != B || vS.GetDim(2) != T,
+                    OP_LOGE(inputParams_.opName,
+                            "v must be [B,H,T,D] with B/T matching q, got v[0]=%ld v[2]=%ld qB=%ld qT=%ld",
+                            vS.GetDim(0), vS.GetDim(2), B, T),
+                    return ge::GRAPH_FAILED);
     } else {
         OP_LOGE(inputParams_.opName, "v must be 4D [B,H,T,D], got rank %zu", vS.GetDimNum());
         return ge::GRAPH_FAILED;
@@ -135,6 +141,12 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
     if (hS.GetDimNum() == 5) {
         // h: [B, H, NT, D, D]
         NT = hS.GetDim(2);
+        OP_CHECK_IF(hS.GetDim(0) != B || hS.GetDim(1) != H ||
+                        hS.GetDim(3) != K || hS.GetDim(4) != V,
+                    OP_LOGE(inputParams_.opName,
+                            "h must be [B,H,NT,D,D] matching q/v, got h[0]=%ld h[1]=%ld h[3]=%ld h[4]=%ld",
+                            hS.GetDim(0), hS.GetDim(1), hS.GetDim(3), hS.GetDim(4)),
+                    return ge::GRAPH_FAILED);
     } else {
         OP_LOGE(inputParams_.opName, "h must be 5D [B,H,NT,D,D], got rank %zu", hS.GetDimNum());
         return ge::GRAPH_FAILED;
@@ -161,8 +173,10 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeAttrs()
     OP_CHECK_NULL_WITH_CONTEXT(context_, attrs);
     float scale = *attrs->GetAttrPointer<float>(SCALE_ATTR_INDEX);
     int64_t cs  = *attrs->GetAttrPointer<int64_t>(CHUNK_SIZE_ATTR_INDEX);
-    OP_CHECK_IF(cs != SUPPORTED_BT,
-                OP_LOGE(inputParams_.opName, "chunk_size must be %ld, got %ld", SUPPORTED_BT, cs),
+    OP_CHECK_IF(cs <= 0 || cs > MAX_BT || (cs % BT_ALIGN) != 0,
+                OP_LOGE(inputParams_.opName,
+                        "chunk_size must be positive, %ld-aligned and no greater than %ld, got %ld",
+                        BT_ALIGN, MAX_BT, cs),
                 return ge::GRAPH_FAILED);
     tilingData_.set_scale(scale);
     tilingData_.set_chunkSize(cs);

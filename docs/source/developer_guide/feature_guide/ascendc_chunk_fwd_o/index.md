@@ -628,7 +628,7 @@ BK=128, BV=128, bf16`）跟踪 `vllm_ascend/ops/triton/fla/chunk_o.py` 中
 ```mermaid
 flowchart TD
     A["chunk_fwd_o(q, k, v, h, g, scale, cu_seqlens, chunk_size, chunk_offsets)"]
-    A --> B["B, T, Hg, K = q.shape<br/>H, V = v.shape[-2:]<br/>BT = chunk_size = 64"]
+    A --> B["B, T, Hg, K = q.shape<br/>H, V = v.shape[-2:]<br/>BT = chunk_size"]
     B --> C{"scale is None?"}
     C -->|是| C1["scale = K ** -0.5 = 1/sqrt(128) ≈ 0.0884"]
     C -->|否| C2["保持用户传入"]
@@ -1139,11 +1139,12 @@ flowchart LR
 |  | INPUT | `scale` | 注意力缩放系数 | 可选 | float | float 标量 | `1.0 / sqrt(D)` |   |   |   |
 |  | INPUT | `cu_seqlens` | 变长场景下每个序列的累积长度，用于按序列切分扁平化的 q/k/v | 必选 | tensor | int64 |   | ND | `[N+1]` | 递增序列，0 ~ T |
 |  | INPUT | `chunk_indices` | chunk 索引表，变长场景下定位每个 chunk 的所属序列与序列内序号；第一列 = chunk 所属序列 id，第二列 = chunk 在序列内的 id | 必选 | tensor | int64 |   | ND | `[NT, 2]` | 全 0 tensor（按规则填充） |
-|  | ATTR | `chunk_size` | T 轴切分的 chunk 大小，当前仅支持 64 | 必选 | int | int64 | 64 |   |   | 64 |
-|  | OUTPUT | `o` | 最终注意力输出 | 必选 | tensor | bf16 |   | ND | `[B, H, T, D]` |   |
+|  | ATTR | `chunk_size` | T 轴切分的 chunk 大小，当前支持 16 对齐且不超过 64 的正整数，典型取 64 | 必选 | int | int64 | 64 |   |   | 16/32/48/64 |
+|  | OUTPUT | `o` | 最终注意力输出 | 必选 | tensor | bf16 |   | ND | `[B, T, H, D]` |   |
 
-> 备注：本算子在 host 端只接受 `chunk_size = 64`（与 triton 参考实现的硬编码一致），
-> 其它取值会在 tiling 阶段返回 `GRAPH_FAILED`。
+> 备注：本算子在 host 端接受 16 对齐且不超过 64 的 `chunk_size`；其它取值会在
+> tiling 阶段返回 `GRAPH_FAILED`。kernel 内部读取 q/k 时按 head 维跳步搬入，
+> 等效 `[B,Hg,T,D]`，写回 o 时按 `[B,T,H,D]` 布局跳写。
 
 ---
 
@@ -1286,8 +1287,11 @@ sequenceDiagram
 * **修正 h 形状**：从原先的 `[NT_total, H, D, D]` 改为参数表要求的
   `[B, H, NT, D, D]`，对应偏移
   `hOffset = i_h * NT * K * V + i_tg * K * V + i_v * BV`。
-* **修正 v / o 形状**：与参数表一致 `[B, H, T, D]`，偏移
-  `vOffset = oOffset = i_h * T * V + (bos + i_t * BT) * V + i_v * BV`。
+* **修正 v / o 形状**：`v` 输入保持 `[B, H, T, D]`，`o` 输出改为
+  `[B, T, H, D]`。kernel 读取 q/k 时按 head 维跳步搬入，等效
+  `[B,Hg,T,D]`；写回 o 时使用
+  `oOffset = (bos + i_t * BT) * H * V + i_h * V + i_v * BV` 和
+  token-major stride 完成转置输出。
 * **`chunk_offsets` → `chunk_indices`**：第二列改为存 chunk-in-seq id，
   整体 shape `[NT, 2]`，与参数表一致。kernel 通过
   `chunk_indices[i_tg, :]` 一次读出 `(i_n, i_t)`。

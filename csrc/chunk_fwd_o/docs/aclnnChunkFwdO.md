@@ -42,8 +42,8 @@ aclnnStatus aclnnChunkFwdOGetWorkspaceSize(
 | `cuSeqlens` | 输入 | 累积序列长度，INT64，ND，shape `[N + 1]` |
 | `chunkIndices` | 输入 | chunk 索引表，INT64，ND，shape `[totalChunks, 2]` |
 | `scale` | 输入 | 输出缩放系数，常用 `1 / sqrt(K)` |
-| `chunkSize` | 输入 | chunk 大小，当前仅支持 64 |
-| `o` | 输出 | 输出 tensor，BF16/FP16，ND，shape 与 `v` 一致 |
+| `chunkSize` | 输入 | chunk 大小，当前支持 16 对齐且不超过 64 的正整数，典型取 64 |
+| `o` | 输出 | 输出 tensor，BF16/FP16，ND，shape `[B, T, H, V]` |
 | `workspaceSize` | 输出 | 返回执行所需 device workspace 字节数 |
 | `executor` | 输出 | 返回 op executor，供第二段接口执行 |
 
@@ -83,10 +83,11 @@ aclnnStatus aclnnChunkFwdO(
 
 ## 约束
 
-* `chunkSize` 必须为 64。
+* `chunkSize` 必须为 16 对齐且不超过 64 的正整数。
 * Python 分发器要求 `K % 16 == 0`、`V % 16 == 0`，不满足时回落 triton。
-* 输出 shape 由 infer shape 设置为与 `v` 完全一致，输出 dtype 设置为与 `q`
-  一致。
+* 输出 shape 由 infer shape 设置为 `[B,T,H,V]`，输出 dtype 设置为与 `q` 一致；
+  kernel 写回时按 token-major stride 跳写，相对输入 `v` 的 `[B,H,T,V]`
+  布局完成转置。
 * 当前支持芯片配置为 `ascend910b` 和 `ascend910_93`。
 * `g == nullptr` 时跳过 gate 分支，但仍执行 causal mask。
 

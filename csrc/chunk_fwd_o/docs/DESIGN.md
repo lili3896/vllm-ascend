@@ -26,9 +26,10 @@ triton 路径。
   基准。
 * **精度通过标准**：AscendC 输出转 fp32 后与 triton 输出
   `torch.testing.assert_close(atol=1e-2, rtol=1e-2)`。
-* **验收范围**：业务 shape 和泛化 shape 均覆盖 `chunk_size = 64`、
-  `K % 16 == 0`、`V % 16 == 0`、dtype 为 BF16/FP16 的场景；NPU 数值对比需
-  在自定义算子已注册且 NPU 可用时执行。
+* **验收范围**：业务 shape 覆盖 `chunk_size = 64`，泛化 shape 覆盖
+  `chunk_size` 为 16 对齐且不超过 64 的场景；`K % 16 == 0`、
+  `V % 16 == 0`、dtype 为 BF16/FP16；NPU 数值对比需在自定义算子已注册且
+  NPU 可用时执行。
 
 #### 1.2.2 性能标准
 
@@ -52,9 +53,10 @@ triton 路径。
 
 泛化范围：
 
-* `chunk_size` 当前仅支持 64。
+* `chunk_size` 当前支持 16 对齐且不超过 64 的正整数；典型业务取 64。
 * `K`、`V` 需 16 对齐；`V` 按 `BV = min(128, V)` 分块，`vLoops = ceil(V/BV)`。
-* `q/k` shape 为 `[B, T, Hg, K]`，`v/o` shape 为 `[B, H, T, V]`。
+* `q/k` shape 为 `[B, T, Hg, K]`，`v` shape 为 `[B, H, T, V]`，
+  `o` shape 为 `[B, T, H, V]`。
 * `H` 需能按 GQA 规则映射到 `Hg`，kernel 使用 `i_hg = Hg == H ? i_h : i_h / (H / Hg)`。
 
 ## 二、约束和周边影响评估
@@ -121,23 +123,24 @@ O_t       = (O_cross + O_intra) * scale
 | `q` | 查询向量 | 必选 | BF16/FP16 | ND | `[B, T, Hg, K]` | 典型随机有限值 | aclnn 入口会连续化 | `K % 16 == 0` | 不支持 | 不建议；按浮点传播 |
 | `k` | 键向量 | 必选 | BF16/FP16 | ND | `[B, T, Hg, K]` | 典型随机有限值 | aclnn 入口会连续化 | `K % 16 == 0` | 不支持 | 不建议；按浮点传播 |
 | `v` | 值向量 | 必选 | BF16/FP16 | ND | `[B, H, T, V]` | 典型随机有限值 | aclnn 入口会连续化 | `V % 16 == 0` | 不支持 | 不建议；按浮点传播 |
-| `h` | chunk 起点隐状态 | 必选 | BF16/FP16 | ND | 接口约定为 5D，host 读取 `h.shape[2]` 作为 `numChunks` | 典型随机有限值 | aclnn 入口会连续化 | `K/V` 与 `q/v` 一致 | 不支持 | 不建议；按浮点传播 |
+| `h` | chunk 起点隐状态 | 必选 | BF16/FP16 | ND | `[B, H, NT, K, V]`，host 读取 `h.shape[2]` 作为 `numChunks` | 典型随机有限值 | aclnn 入口会连续化 | `K/V` 与 `q/v` 一致 | 不支持 | 不建议；按浮点传播 |
 | `g` | 可选 gate，AIV 端用于 `exp(g)` 衰减 | 可选 | FP32 | ND | `[B, H, T]` | 通常为非正累积衰减 | aclnn 入口会连续化 | T 维连续 | 不传时跳过 gate | 不建议；exp 可能放大异常 |
 | `cu_seqlens` | 累积序列长度 | 必选 | INT64 | ND | `[N + 1]` | 单调递增，首元素为 0 | aclnn 入口会连续化 | 无 | 不支持 | 不适用 |
 | `chunk_indices` | chunk 索引表，列 0 为序列 id，列 1 为序列内 chunk id | 必选 | INT64 | ND | `[totalChunks, 2]` | 合法序列 id 和 chunk id | aclnn 入口会连续化 | 无 | 不支持 | 不适用 |
 | `scale` | 输出缩放系数 | 必选 attr | FP32 标量 | - | 标量 | 默认通常为 `1/sqrt(K)` | - | - | - | 需为有限值 |
-| `chunk_size` | T 轴 chunk 大小 | 必选 attr | INT64 标量 | - | 标量 | 仅支持 64 | - | 固定 64 | - | 不适用 |
-| `o` | 输出 tensor，shape/dtype 与 `v` 一致 | 必选输出 | BF16/FP16 | ND | `[B, H, T, V]` | 由输入决定 | ViewCopy 到调用方输出 | `V % 16 == 0` | 不支持 | 按浮点传播 |
+| `chunk_size` | T 轴 chunk 大小 | 必选 attr | INT64 标量 | - | 标量 | 典型 64；泛化支持 16 对齐且不超过 64 | - | `16/32/48/64` | - | 不适用 |
+| `o` | 输出 tensor，dtype 与 `q` 一致，布局为 token-major | 必选输出 | BF16/FP16 | ND | `[B, T, H, V]` | 由输入决定 | ViewCopy 到调用方输出 | `V % 16 == 0` | 不支持 | 按浮点传播 |
 
 **其他约束**：
 
 * `q/k/v/h/o` dtype 必须为 BF16 或 FP16，且 `o` dtype 与 `q` 一致。
 * `cu_seqlens`、`chunk_indices` 必须为 INT64。
-* `chunk_size != 64` 会在 host tiling 阶段返回失败；Python 分发器会提前回落
-  triton。
+* `chunk_size` 必须为 16 对齐且不超过 64 的正整数；超出该范围会在 host tiling
+  阶段返回失败，Python 分发器会提前回落 triton。
 * Python 分发器 `_supports_shape` 要求 `K % 16 == 0` 且 `V % 16 == 0`。
-* 当前 kernel 通过 `totalChunks = chunk_indices.shape[0]` 遍历 chunk；`h`
-  的接口约定、OpDef 维度检查和 device 侧线性偏移需要在评审中保持一致。
+* 当前 kernel 通过 `totalChunks = chunk_indices.shape[0]` 遍历 chunk；`q/k`
+  从 `[B,T,Hg,D]` 按 head 维跳步搬入，等效内部 `[B,Hg,T,D]`；`o` 按
+  `[B,T,H,D]` 跳步写回，实现相对 `v` 的转置输出。
 
 ### 3.3 其他算子功能支持
 
@@ -288,8 +291,8 @@ chunk_indices[i_tg] = [i_n, i_t]
 
 | 项目 | 描述 |
 |------|------|
-| 单次处理数据量 | `BT = 64` token，`BV = min(128, V)` value 维 |
-| 是否分 chunk | 是，T 维按 `chunk_size = 64` 切 chunk；V 维按 `BV = 128` 切块 |
+| 单次处理数据量 | `BT = chunk_size` token（当前实现上限 64），`BV = min(128, V)` value 维 |
+| 是否分 chunk | 是，T 维按 `chunk_size` 切 chunk；V 维按 `BV = min(128, V)` 切块 |
 | chunk 大小计算公式 | `numChunks = h.shape[2]`，`totalChunks = chunk_indices.shape[0]`，`vLoops = ceil(V / BV)` |
 
 AIV 内按 `GetSubBlockIdx()` 将 `BT` 行均分给两个 AIV 子核：
@@ -392,7 +395,8 @@ TilingKey 由 host 侧设置：BF16 为 0，FP16 为 1。
 2. AIV: GM(attnWs, g) -> UB gate/mask/cast -> GM(amWs)
 3. AIC: GM(q, h) -> Matmul(Q@H) -> GM(hWs)
 4. AIC: GM(amWs, v) -> Matmul(A@V) -> GM(vWs)
-5. AIV: GM(hWs, vWs, g) -> UB add/scale/cast -> GM(o)
+5. AIV: GM(hWs, vWs, g) -> UB add/scale/cast -> GM(o)，写回时按
+   `[B,T,H,D]` 的 token-major stride 跳写
 ```
 
 #### 内存管理
@@ -410,13 +414,17 @@ TilingKey 由 host 侧设置：BF16 为 0，FP16 为 1。
 
 业务 shape：
 
-* `(B=2, T=512, H=4, K=64, V=64, dtype=BF16)`
-* `(B=1, T=2048, H=8, K=128, V=128, dtype=BF16)`
-* `(B=2, T=256, H=4, K=64, V=64, dtype=FP16)`
+* 典型：`B=1`，TokenBatch（子序列数）`[1,4]`，`T` 覆盖
+  `[1K, 64K * TokenBatch]`，`H` 覆盖 `[2,32]`，`D=128`，
+  `chunk_size=64`，dtype=BF16。
+* 现有 UT：`(B=2, T=512, H=4, K=64, V=64, dtype=BF16)`、
+  `(B=1, T=2048, H=8, K=128, V=128, dtype=BF16)`、
+  `(B=2, T=256, H=4, K=64, V=64, dtype=FP16)`。
 
 泛化 shape：
 
-* `B >= 1`，`T >= 1`，`H >= Hg >= 1`。
+* 泛化：`B=1`，TokenBatch（子序列数）`[1,128]`，`T >= 1`，
+  `H` 覆盖 `[2,1024]`，`H % Hg == 0`。
 * `K`、`V` 为 16 的倍数。
 * `T` 可非 64 整倍，尾 chunk 由 `actBT` 处理。
 * 支持 `cu_seqlens` 表示的 varlen 场景，`chunk_indices` 需与
@@ -424,7 +432,8 @@ TilingKey 由 host 侧设置：BF16 为 0，FP16 为 1。
 
 range 值域：
 
-* `q/k/v/h` 使用有限随机值；`h` 通常范围较小以避免累积放大。
+* `q/k` 典型值域 `[-1,1]`；`v` 典型值域 `[-50,50]`；
+  `h` 典型值域 `[-100,100]`；泛化值域按 L1。
 * `g` 为 FP32，通常为非正累积衰减；异常值 `nan/inf/-inf` 不作为支持范围。
 * `scale` 需为有限 FP32，默认可取 `K ** -0.5`。
 
@@ -436,7 +445,8 @@ range 值域：
 Python 分发器：
 
 * AscendC op 未注册时回落 triton。
-* `chunk_size != 64` 时回落 triton。
+* 非法 `chunk_size`（非 16 对齐、非正数或大于 64）时回落 triton。
+* `chunk_size=32` 等非 64 但满足约束的值会进入 AscendC 支持范围。
 * 环境变量 `VLLM_ASCEND_DISABLE_CHUNK_FWD_O_ASCENDC=1` 时强制回落 triton。
 
 命令：
