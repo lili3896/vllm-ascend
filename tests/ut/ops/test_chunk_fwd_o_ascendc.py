@@ -48,8 +48,16 @@ class TestChunkFwdODispatcher(unittest.TestCase):
             triton_fn.assert_called_once()
             self.assertIs(out, triton_fn.return_value)
 
-    def test_unsupported_chunk_size_falls_back(self):
-        """非 64 的 chunk_size 必须走 triton 路径。"""
+    def test_non_64_chunk_size_is_supported_when_aligned(self):
+        """16 对齐且不超过 64 的非 64 chunk_size 也在 AscendC 支持范围内。"""
+        from vllm_ascend.ops.triton.fla import chunk_o_ascendc as mod
+
+        q = torch.zeros((1, 32, 1, 64))
+        v = torch.zeros((1, 32, 1, 64))
+        self.assertTrue(mod._supports_shape(q, v, chunk_size=32))
+
+    def test_invalid_chunk_size_falls_back(self):
+        """不满足实现约束的 chunk_size 必须走 triton 路径。"""
         from vllm_ascend.ops.triton.fla import chunk_o_ascendc as mod
         with mock.patch.object(mod, "_ascendc_chunk_fwd_o_available",
                                return_value=True), \
@@ -59,7 +67,7 @@ class TestChunkFwdODispatcher(unittest.TestCase):
             k = torch.zeros_like(q)
             v = torch.zeros((1, 32, 1, 64))
             h = torch.zeros((1, 1, 64, 64))
-            mod.chunk_fwd_o_ascendc(q, k, v, h, chunk_size=32)
+            mod.chunk_fwd_o_ascendc(q, k, v, h, chunk_size=8)
             triton_fn.assert_called_once()
 
     def test_env_disable_forces_fallback(self):
@@ -90,8 +98,8 @@ class TestChunkFwdONumerical(unittest.TestCase):
         v = torch.randn(B, T, H, V, dtype=dtype, device=device)
         BT = 64
         NT = (T + BT - 1) // BT
-        h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
-        g = torch.randn(B, H, T, dtype=torch.float32, device=device) * -0.1
+        h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
+        g = torch.randn(B, T, H, dtype=torch.float32, device=device) * -0.1
 
         cu_seqlens = None
         if varlen:

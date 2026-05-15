@@ -17,7 +17,7 @@
  *      v : [B, H, T, D]   bf16
  *      h : [B, H, NT,D,D] bf16
  *      g : [B, H, T]      fp32
- *      o : [B, H, T, D]   bf16
+ *      o : [B, T, H, D]   bf16
  *      cu_seqlens    : [N+1] int64
  *      chunk_indices : [NT, 2] int64  // [seq_id, chunk_in_seq_id]
  *
@@ -57,9 +57,9 @@ using namespace AscendC;
 using namespace matmul;
 
 // 算法常量
-constexpr uint32_t BT          = CHUNK_FWD_O_BT;      // chunk 大小，固定 64
 constexpr uint32_t BV_MAX      = CHUNK_FWD_O_BV;      // V 方向块大小上限，128
 constexpr uint32_t MASK_FP32   = 64;                  // 向量指令每次 mask 元素数
+constexpr int64_t WORKSPACE_ALIGN = 512;
 
 // CV 融合的跨核同步 flag。基地址 + buf_idx 区分 ping/pong。
 constexpr uint32_t FLAG_CUBE1_DONE_BASE  = 3;
@@ -110,6 +110,8 @@ __aicore__ inline void ComputeOffsetsFromTaskId(
     int64_t T      = td.seqlen;
     int64_t NT     = td.totalChunks;
     int64_t vLoops = td.vLoops;
+    int64_t BT     = td.chunkSize;
+    int64_t BV     = (V < static_cast<int64_t>(BV_MAX)) ? V : static_cast<int64_t>(BV_MAX);
 
     // 任务分解顺序：i_v 最内层，i_tg 中层，i_h 最外层
     int64_t i_v  = taskId % vLoops;
@@ -127,18 +129,23 @@ __aicore__ inline void ComputeOffsetsFromTaskId(
 
     int64_t i_hg = (Hg == H) ? i_h : (i_h / (H / Hg));
 
-    // 各张量的元素偏移（详见文件头形状注释）
-    off.qOffset = (bos + i_t * BT) * Hg * K + i_hg * K;
+    int64_t tokenOffset = bos + i_t * BT;
+    int64_t vStart = i_v * BV;
+
+    // 各张量的元素偏移（详见文件头形状注释）。
+    // q/k 对外是 [B,T,Hg,D]，这里按固定 head 跳步读取，等效搬入 [B,Hg,T,D]。
+    off.qOffset = tokenOffset * Hg * K + i_hg * K;
     off.kOffset = off.qOffset;
-    off.vOffset = i_h * T * V + (bos + i_t * BT) * V + i_v * BV_MAX;
-    off.hOffset = i_h * NT * K * V + i_tg * K * V + i_v * BV_MAX;
-    off.gOffset = i_h * T + bos + i_t * BT;
-    off.oOffset = off.vOffset;
+    off.vOffset = i_h * T * V + tokenOffset * V + vStart;
+    off.hOffset = i_h * NT * K * V + i_tg * K * V + vStart;
+    off.gOffset = i_h * T + tokenOffset;
+    // o 对外是 [B,T,H,D]，按 token-major 布局跳步写回，实现输出转置效果。
+    off.oOffset = tokenOffset * H * V + i_h * V + vStart;
 
     int64_t actBT = Tcur - i_t * BT;
-    off.actBT = (actBT > static_cast<int64_t>(BT)) ? BT : (actBT < 0 ? 0 : actBT);
-    int64_t actBV = V - i_v * BV_MAX;
-    off.actBV = (actBV > static_cast<int64_t>(BV_MAX)) ? BV_MAX : actBV;
+    off.actBT = (actBT > BT) ? BT : (actBT < 0 ? 0 : actBT);
+    int64_t actBV = V - vStart;
+    off.actBV = (actBV > BV) ? BV : actBV;
 
     off.i_v = i_v;
     off.i_n = i_n;
@@ -257,10 +264,13 @@ private:
     __aicore__ inline void InitWorkspaceTensors(GM_ADDR workspace)
     {
         int64_t aicId       = GetBlockIdx();
-        int64_t hSlotBytes  = BT * BV_MAX * sizeof(L0_T);
-        int64_t attnSlotBytes = BT * BT * sizeof(L0_T);
+        int64_t BT          = td_->chunkSize;
+        int64_t BV          = (td_->vHeadDim < static_cast<int64_t>(BV_MAX)) ?
+            td_->vHeadDim : static_cast<int64_t>(BV_MAX);
+        int64_t hSlotBytes  = AlignUp<int64_t>(BT * BV * sizeof(L0_T), WORKSPACE_ALIGN);
+        int64_t attnSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(L0_T), WORKSPACE_ALIGN);
         int64_t vSlotBytes  = hSlotBytes;
-        int64_t amSlotBytes = BT * BT * sizeof(Q_T);
+        int64_t amSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(Q_T), WORKSPACE_ALIGN);
 
         int64_t hAicBytes  = PING_PONG_STAGES * hSlotBytes;
         int64_t attnAicBytes = PING_PONG_STAGES * attnSlotBytes;
@@ -281,15 +291,18 @@ private:
 
     __aicore__ inline void InitMatmul()
     {
+        int64_t BT = td_->chunkSize;
+        int64_t BV = (td_->vHeadDim < static_cast<int64_t>(BV_MAX)) ?
+            td_->vHeadDim : static_cast<int64_t>(BV_MAX);
         int64_t K = td_->kHeadDim;
         int64_t V = td_->vHeadDim;
         int64_t Hg = td_->kNumHead;
         // Q@H : A 行步幅 Hg*K（q 切片自 [T,Hg,K]）；B 行步幅 V（h 末两维连续）；C 行步幅 BV
-        mmQH.SetOrgShape(BT, BV_MAX, Hg * K, V, BV_MAX);
+        mmQH.SetOrgShape(BT, BV, Hg * K, V, BV);
         // Q@K^T : A/B 行步幅 Hg*K；C 行步幅 BT
         mmQK.SetOrgShape(BT, BT, Hg * K, Hg * K, BT);
         // A@V : A 行步幅 BT（来自 amWs 连续）；B 行步幅 V（v 切片连续）；C 行步幅 BV
-        mmAV.SetOrgShape(BT, BV_MAX, BT, V, BV_MAX);
+        mmAV.SetOrgShape(BT, BV, BT, V, BV);
     }
 
     const ChunkFwdOTilingData* td_ {nullptr};
@@ -328,8 +341,11 @@ public:
         InitWorkspaceTensors(workspace);
 
         // UB 缓冲
-        const uint32_t btAlign = AlignUp<uint32_t>(BT, 16);
-        const uint32_t bvAlign = AlignUp<uint32_t>(BV_MAX, 16);
+        const uint32_t bt = static_cast<uint32_t>(td_->chunkSize);
+        const uint32_t bv = static_cast<uint32_t>(
+            td_->vHeadDim < static_cast<int64_t>(BV_MAX) ? td_->vHeadDim : static_cast<int64_t>(BV_MAX));
+        const uint32_t btAlign = AlignUp<uint32_t>(bt, 16);
+        const uint32_t bvAlign = AlignUp<uint32_t>(bv, 16);
         pipe->InitBuffer(qhBuf_,   btAlign * bvAlign * sizeof(float));
         pipe->InitBuffer(avBuf_,   btAlign * bvAlign * sizeof(float));
         pipe->InitBuffer(attnBuf_, btAlign * btAlign * sizeof(float));
@@ -390,10 +406,13 @@ private:
     __aicore__ inline void InitWorkspaceTensors(GM_ADDR workspace)
     {
         int64_t aicId       = GetBlockIdx();
-        int64_t hSlotBytes  = BT * BV_MAX * sizeof(float);
-        int64_t attnSlotBytes = BT * BT * sizeof(float);
+        int64_t BT          = td_->chunkSize;
+        int64_t BV          = (td_->vHeadDim < static_cast<int64_t>(BV_MAX)) ?
+            td_->vHeadDim : static_cast<int64_t>(BV_MAX);
+        int64_t hSlotBytes  = AlignUp<int64_t>(BT * BV * sizeof(float), WORKSPACE_ALIGN);
+        int64_t attnSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(float), WORKSPACE_ALIGN);
         int64_t vSlotBytes  = hSlotBytes;
-        int64_t amSlotBytes = BT * BT * sizeof(Q_T);
+        int64_t amSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(Q_T), WORKSPACE_ALIGN);
 
         int64_t hAicBytes  = PING_PONG_STAGES * hSlotBytes;
         int64_t attnAicBytes = PING_PONG_STAGES * attnSlotBytes;
@@ -417,9 +436,10 @@ private:
         if (maskInitialized_) return;
         maskInitialized_ = true;
         LocalTensor<float> mask = maskBuf_.Get<float>();
-        const uint32_t btAlign = AlignUp<uint32_t>(BT, 16);
-        for (uint32_t i = 0; i < BT; ++i) {
-            for (uint32_t j = 0; j < BT; ++j) {
+        const uint32_t bt = static_cast<uint32_t>(td_->chunkSize);
+        const uint32_t btAlign = AlignUp<uint32_t>(bt, 16);
+        for (uint32_t i = 0; i < bt; ++i) {
+            for (uint32_t j = 0; j < bt; ++j) {
                 mask.SetValue(i * btAlign + j, (i >= j) ? 1.0f : 0.0f);
             }
         }
@@ -431,13 +451,15 @@ private:
         uint32_t subId  = GetSubBlockIdx();
         uint32_t subNum = GetSubBlockNum();
         if (subNum == 0) subNum = 1;
-        rowBegin = (BT * subId) / subNum;
-        rowEnd   = (BT * (subId + 1)) / subNum;
+        uint32_t bt = static_cast<uint32_t>(td_->chunkSize);
+        rowBegin = (bt * subId) / subNum;
+        rowEnd   = (bt * (subId + 1)) / subNum;
     }
 
     __aicore__ inline void DoVec1(int64_t buf, const GDNFwdOOffsets& off)
     {
-        const uint32_t btAlign = AlignUp<uint32_t>(BT, 16);
+        const uint32_t bt = static_cast<uint32_t>(td_->chunkSize);
+        const uint32_t btAlign = AlignUp<uint32_t>(bt, 16);
         const uint32_t totalAttn = btAlign * btAlign;
 
         LocalTensor<float> attn = attnBuf_.Get<float>();
@@ -449,10 +471,10 @@ private:
         if (useG) {
             LocalTensor<float> gVec = gBuf_.Get<float>();
             LocalTensor<float> gExp = gExpBuf_.Get<float>();
-            DataCopy(gVec, gGm_[off.gOffset], AlignUp<uint32_t>(BT, 8));
+            DataCopy(gVec, gGm_[off.gOffset], AlignUp<uint32_t>(bt, 8));
             SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
             WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
-            Exp(gExp, gVec, AlignUp<uint32_t>(BT, 8));
+            Exp(gExp, gVec, AlignUp<uint32_t>(bt, 8));
             PipeBarrier<PIPE_V>();
 
             // 每个 AIV 处理 BT 行的一半
@@ -490,8 +512,11 @@ private:
 
     __aicore__ inline void DoVec2(int64_t buf, const GDNFwdOOffsets& off)
     {
-        const uint32_t btAlign = AlignUp<uint32_t>(BT, 16);
-        const uint32_t bvAlign = AlignUp<uint32_t>(BV_MAX, 16);
+        const uint32_t bt = static_cast<uint32_t>(td_->chunkSize);
+        const uint32_t bv = static_cast<uint32_t>(
+            td_->vHeadDim < static_cast<int64_t>(BV_MAX) ? td_->vHeadDim : static_cast<int64_t>(BV_MAX));
+        const uint32_t btAlign = AlignUp<uint32_t>(bt, 16);
+        const uint32_t bvAlign = AlignUp<uint32_t>(bv, 16);
         const uint32_t totalQH = btAlign * bvAlign;
 
         LocalTensor<float> qh = qhBuf_.Get<float>();
@@ -503,7 +528,7 @@ private:
 
         if (td_->hasG != 0) {
             LocalTensor<float> gVec = gBuf_.Get<float>();
-            DataCopy(gVec, gGm_[off.gOffset], AlignUp<uint32_t>(BT, 8));
+            DataCopy(gVec, gGm_[off.gOffset], AlignUp<uint32_t>(bt, 8));
             SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
             WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
 
@@ -533,14 +558,13 @@ private:
         SetFlag<HardEvent::V_MTE3>(EVENT_ID1);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID1);
 
-        // 输出 o 形状 [B,H,T,D]，每行 V 个元素连续；行间隔 V（D）。
-        // 由于这里 V == BV_MAX（典型）或 actBV ≤ V，DataCopyPad 顺序写
-        // 即可，无需 dstStride（同一 head 的连续 BT 行就是连续 BT*V 元素）。
+        // 输出 o 形状 [B,T,H,D]。同一 head 的相邻 token 在 GM 中相隔 H*D，
+        // 因此通过 dstStride 跳过其它 head 的 D 维数据完成写回转置。
         DataCopyExtParams oParams {
             static_cast<uint16_t>(off.actBT),
             static_cast<uint32_t>(off.actBV * sizeof(Q_T)),
             static_cast<uint32_t>((bvAlign - off.actBV) * sizeof(Q_T) / 32),  // src srcStride（32B 单位）
-            static_cast<uint32_t>((td_->vHeadDim - off.actBV) * sizeof(Q_T)), // dst stride（B）
+            static_cast<uint32_t>((td_->vNumHead * td_->vHeadDim - off.actBV) * sizeof(Q_T)),
             0
         };
         DataCopyPad(oGm_[off.oOffset], out, oParams);

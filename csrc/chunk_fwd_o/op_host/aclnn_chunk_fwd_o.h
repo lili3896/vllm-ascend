@@ -23,14 +23,14 @@ extern "C" {
  * @param [in] q：数据类型支持 BF16、FLOAT16。
  * @param [in] k：数据类型支持 BF16、FLOAT16。
  * @param [in] v：数据类型支持 BF16、FLOAT16。
- * @param [in] h：数据类型支持 BF16、FLOAT16，shape 为 (totalChunks, H, K, V)。
+ * @param [in] h：数据类型支持 BF16、FLOAT16，shape 为 [B,H,NT,K,V]。
  * @param [in] g：可选 gate，数据类型支持 FLOAT32。
  * @param [in] cuSeqlens：累加序列长度，shape [N+1] INT64。
  * @param [in] chunkIndices：chunk 索引表，shape [NT, 2] INT64。
  *             第一列：chunk 所属序列 id；第二列：chunk 在序列内的 id。
  * @param [in] scale：注意力缩放系数。
- * @param [in] chunkSize：chunk 大小（默认 64）。
- * @param [out] o：输出 tensor，shape/dtype 与 v 一致。
+ * @param [in] chunkSize：chunk 大小，当前支持 16 对齐且不超过 64，默认 64。
+ * @param [out] o：输出 tensor，shape 为 [B,T,H,V]，dtype 与 q 一致。
  * @param [out] workspaceSize：device 端需申请的 workspace 字节数。
  * @param [out] executor：返回的 op 执行器。
  * @return aclnnStatus：状态码。

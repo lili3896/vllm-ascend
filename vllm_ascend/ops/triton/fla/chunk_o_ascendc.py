@@ -20,7 +20,7 @@ ping-pong 流水中让 AIV（Vector）核同时完成 exp(g)、causal mask、缩
 * vllm-ascend 构建未启用自定义算子；
 * ``npu_chunk_fwd_o`` 未在 ``torch.ops._C_ascend`` 中注册；
 * 当前输入 shape 不在 AscendC kernel 的支持范围内（当前要求 ``K``、``V``
-  对齐到 16，并且 ``chunk_size == 64``）。
+  对齐到 16，``chunk_size`` 为 16 对齐且不超过 64）。
 """
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ from .chunk_o import chunk_fwd_o as _triton_chunk_fwd_o
 from .utils import prepare_chunk_indices
 
 _ASCENDC_OP_AVAILABLE: bool | None = None
+_CHUNK_SIZE_ALIGNMENT = 16
+_MAX_CHUNK_SIZE = 64
 
 
 def _ascendc_chunk_fwd_o_available() -> bool:
@@ -58,7 +60,8 @@ def _ascendc_chunk_fwd_o_available() -> bool:
 
 def _supports_shape(q: torch.Tensor, v: torch.Tensor, chunk_size: int) -> bool:
     """判断当前 (q, v, chunk_size) 是否落在 AscendC kernel 支持范围内。"""
-    if chunk_size != 64:
+    if (chunk_size <= 0 or chunk_size > _MAX_CHUNK_SIZE
+            or chunk_size % _CHUNK_SIZE_ALIGNMENT != 0):
         return False
     K = q.shape[-1]
     V = v.shape[-1]
@@ -131,6 +134,15 @@ def chunk_fwd_o_ascendc(
     cu_seqlens_t = _maybe_build_cu_seqlens(q, cu_seqlens).contiguous()
     chunk_indices_t = _build_chunk_indices(cu_seqlens_t, chunk_size)
 
+    # L0 算子入参 v/h 使用 [B,H,T,D] / [B,H,NT,D,D]，Python 参考路径使用
+    # token-major 布局，因此这里在进入自定义算子前完成一次布局转换。
+    v_in = v.transpose(1, 2).contiguous()
+    h_in = h
+    if h.dim() == 5 and h.shape[1] != v.shape[-2] and h.shape[2] == v.shape[-2]:
+        h_in = h.transpose(1, 2).contiguous()
+    else:
+        h_in = h.contiguous()
+
     # AscendC kernel 期望 g 是 (B, H, T) 布局，与 triton 实现转置后的输入一致。
     g_in: torch.Tensor | None = None
     if g is not None:
@@ -139,8 +151,8 @@ def chunk_fwd_o_ascendc(
     o = torch.ops._C_ascend.npu_chunk_fwd_o(
         q.contiguous(),
         k.contiguous(),
-        v.contiguous(),
-        h.contiguous(),
+        v_in,
+        h_in,
         g_in,
         cu_seqlens_t,
         chunk_indices_t,

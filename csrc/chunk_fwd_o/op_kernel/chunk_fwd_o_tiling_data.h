@@ -25,8 +25,8 @@
 namespace ChunkFwdO {
 
 // chunk 算法常量（与 triton 参考实现一致）
-constexpr uint32_t CHUNK_FWD_O_BT = 64;          // 单 chunk 的 token 数
-constexpr uint32_t CHUNK_FWD_O_BV = 128;         // V 方向块大小
+constexpr uint32_t CHUNK_FWD_O_MAX_BT = 64;      // 单 chunk token 数的当前实现上限
+constexpr uint32_t CHUNK_FWD_O_BV = 128;         // V 方向块大小上限
 
 // 数据类型编码
 constexpr uint32_t CHUNK_FWD_O_DTYPE_BF16 = 0;
@@ -44,7 +44,7 @@ struct alignas(8) ChunkFwdOTilingData {
     int64_t kHeadDim;                   // D ：q/k head dim（= K）
     int64_t vHeadDim;                   // D ：v/o head dim（= V）
     float   scale;                      // 注意力缩放，默认 1/sqrt(D)
-    int64_t chunkSize;                  // BT，仅支持 64
+    int64_t chunkSize;                  // BT，运行时 chunk 大小，当前要求 16 对齐且不超过 MAX_BT
     int64_t isVariedLen;                // 0=固定 shape，1=cu_seqlens 变长
     int64_t totalChunks;                // NT：chunk_indices 的行数
     int64_t numChunks;                  // 单 batch 的最大 chunk 数（h 的第 3 维）

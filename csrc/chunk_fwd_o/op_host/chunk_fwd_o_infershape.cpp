@@ -9,7 +9,7 @@
 
 /*!
  * \file chunk_fwd_o_infershape.cpp
- * \brief ChunkFwdO 的 shape/dtype 推导：输出 o 与输入 v 形状/dtype 完全一致。
+ * \brief ChunkFwdO 的 shape/dtype 推导：输出 o 为 [B,T,H,D]，dtype 与 q 一致。
  */
 
 #include "exe_graph/runtime/infer_shape_context.h"
@@ -22,18 +22,25 @@ namespace ops {
 
 constexpr size_t V_INDEX = 2;
 constexpr size_t Q_INDEX = 0;
+constexpr size_t RANK_4D = 4;
 
 static ge::graphStatus InferShapeChunkFwdO(gert::InferShapeContext* context)
 {
+    auto* shapeQ = context->GetInputShape(Q_INDEX);
     auto* shapeV = context->GetInputShape(V_INDEX);
     auto* shapeOut = context->GetOutputShape(0);
-    if (shapeV == nullptr || shapeOut == nullptr) {
+    if (shapeQ == nullptr || shapeV == nullptr || shapeOut == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    shapeOut->SetDimNum(shapeV->GetDimNum());
-    for (size_t i = 0; i < shapeV->GetDimNum(); ++i) {
-        shapeOut->SetDim(i, shapeV->GetDim(i));
+    if (shapeQ->GetDimNum() != RANK_4D || shapeV->GetDimNum() != RANK_4D) {
+        return ge::GRAPH_FAILED;
     }
+    // q: [B,T,Hg,D], v: [B,H,T,D] -> o: [B,T,H,D]
+    shapeOut->SetDimNum(RANK_4D);
+    shapeOut->SetDim(0, shapeQ->GetDim(0));
+    shapeOut->SetDim(1, shapeQ->GetDim(1));
+    shapeOut->SetDim(2, shapeV->GetDim(1));
+    shapeOut->SetDim(3, shapeV->GetDim(3));
     return ge::GRAPH_SUCCESS;
 }
 
