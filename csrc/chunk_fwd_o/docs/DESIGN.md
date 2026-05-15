@@ -1,8 +1,8 @@
 # ChunkFwdO 设计文档
 
-# 一、需求
+## 一、需求
 
-## 1.1 需求背景和描述
+### 1.1 需求背景和描述
 
 `ChunkFwdO` 面向 vLLM Ascend 中 Flash-Linear-Attention（FLA）系列模型
 （如 Gated DeltaNet、RWKV-7）的 chunk 前向输出计算。原有
@@ -17,9 +17,9 @@ chunk 输出阶段性能。PyTorch 侧通过
 `torch.ops._C_ascend.npu_chunk_fwd_o` 调用，未注册或 shape 不支持时回落到
 triton 路径。
 
-## 1.2 验收标准
+### 1.2 验收标准
 
-### 1.2.1 精度标准
+#### 1.2.1 精度标准
 
 * **标杆算子:** 以 `vllm_ascend.ops.triton.fla.chunk_o.chunk_fwd_o` 作为
   精度比较基准；无 NPU 自定义算子环境下以 Python 分发器回落行为为 CI
@@ -30,7 +30,7 @@ triton 路径。
   `K % 16 == 0`、`V % 16 == 0`、dtype 为 BF16/FP16 的场景；NPU 数值对比需
   在自定义算子已注册且 NPU 可用时执行。
 
-### 1.2.2 性能标准
+#### 1.2.2 性能标准
 
 * **性能基线**: triton 参考实现 `chunk_fwd_o`。
 * **性能通过标准**：在支持 shape 上，device 侧应通过 Cube 矩阵乘和
@@ -39,7 +39,7 @@ triton 路径。
 * **验收范围**：重点验收业务 shape；泛化验收覆盖不同 `B/T/H/K/V`、
   varlen/fixed length、BF16/FP16 与 `g` 可选分支。
 
-## 1.3 业务 shape
+### 1.3 业务 shape
 
 当前 UT 中已有 NPU 数值用例覆盖：
 
@@ -57,9 +57,9 @@ triton 路径。
 * `q/k` shape 为 `[B, T, Hg, K]`，`v/o` shape 为 `[B, H, T, V]`。
 * `H` 需能按 GQA 规则映射到 `Hg`，kernel 使用 `i_hg = Hg == H ? i_h : i_h / (H / Hg)`。
 
-# 二、约束和周边影响评估
+## 二、约束和周边影响评估
 
-## 2.1 周边依赖
+### 2.1 周边依赖
 
 1. docker 镜像
    * 仓库未在 `csrc/chunk_fwd_o` 中固定镜像地址；按交付环境或 CI 镜像补齐。
@@ -77,7 +77,7 @@ triton 路径。
    * `ascend910b`/`ascend910_93` 自定义算子构建依赖
      `csrc/third_party/catlass/include`，构建脚本会尝试初始化 submodule。
 
-## 2.2 支持芯片型号
+### 2.2 支持芯片型号
 
 OpDef 中 AICore 配置支持：
 
@@ -87,9 +87,9 @@ OpDef 中 AICore 配置支持：
 构建脚本注释中 `ascend910b` 对应 Ascend 910B（A2）系列，
 `ascend910_93` 对应 Ascend 910C（A3）系列。
 
-# 三、算子功能及定义
+## 三、算子功能及定义
 
-## 3.1 算子功能分析
+### 3.1 算子功能分析
 
 * 算子功能：计算 FLA chunk 前向输出 `o`。输入包含当前 chunk 的
   `q/k/v`、chunk 起点隐状态 `h`、可选门控 `g`、序列切分信息和缩放系数。
@@ -114,7 +114,7 @@ O_t       = (O_cross + O_intra) * scale
 `j > i`。`safe_exp` 的等价逻辑在 kernel 中通过 `scl = exp(g_i) / exp(g_j)`
 并在 `scl > 1.0` 时置 0 实现。
 
-## 3.2 参数说明
+### 3.2 参数说明
 
 | 参数名 | 参数描述 | 可选/必选 | 数据类型 | 数据格式 | 维度 | 值域 | 是否支持非连续张量 | 是否有数据对齐要求 | 是否支持空 tensor | 异常值域 nan/inf/-inf |
 |--------|---------|----------|---------|---------|------|------|----------------|----------------|--------------|------------------|
@@ -139,14 +139,14 @@ O_t       = (O_cross + O_intra) * scale
 * 当前 kernel 通过 `totalChunks = chunk_indices.shape[0]` 遍历 chunk；`h`
   的接口约定、OpDef 维度检查和 device 侧线性偏移需要在评审中保持一致。
 
-## 3.3 其他算子功能支持
+### 3.3 其他算子功能支持
 
 * 是否支持图模式：OpDef 开启 dynamic shape/dynamic rank/dynamic format，
   支持以 AICore 自定义算子形式接入图执行；实际图模式验收依赖上层集成测试。
 * 是否支持确定性计算：同一输入和同一执行环境下计算路径固定，无随机分支。
 * 是否涉及反向测试：否，本算子仅覆盖前向输出。
 
-### 3.3.2 算子原型定义
+#### 3.3.2 算子原型定义
 
 OpDef 名称：`ChunkFwdO`
 
@@ -169,7 +169,7 @@ chunk_size: int64
 o
 ```
 
-### 3.3.3 接口定义
+#### 3.3.3 接口定义
 
 * aclnn 第一段接口：
 
@@ -231,9 +231,9 @@ def chunk_fwd_o_ascendc(
     ...
 ```
 
-# 四、详细方案设计
+## 四、详细方案设计
 
-## 4.1 计算逻辑
+### 4.1 计算逻辑
 
 kernel 入口 `chunk_fwd_o` 使用 `KERNEL_TYPE_MIX_AIC_1_2`。每个 block
 包含 1 个 AIC 和配对的 2 个 AIV：
@@ -262,9 +262,9 @@ kernel 入口 `chunk_fwd_o` 使用 `KERNEL_TYPE_MIX_AIC_1_2`。每个 block
 | `CUBE23_DONE[buf]` | AIC | AIV | `Q@H`、`A@V` 已写入 `hWs/vWs[buf]` |
 | `VEC2_DONE[buf]` | AIV | AIC | 输出已写回，workspace 可复用 |
 
-## 4.2 Tiling 方案
+### 4.2 Tiling 方案
 
-### 多核切分策略
+#### 多核切分策略
 
 | 项目 | 描述 |
 |------|------|
@@ -284,7 +284,7 @@ chunk_indices[i_tg] = [i_n, i_t]
 
 其中 `i_hg = Hg == H ? i_h : i_h / (H / Hg)` 处理 GQA 头映射。
 
-### UB 切分策略
+#### UB 切分策略
 
 | 项目 | 描述 |
 |------|------|
@@ -299,7 +299,7 @@ rowBegin = BT * subId / subNum
 rowEnd   = BT * (subId + 1) / subNum
 ```
 
-### Buffer 规划
+#### Buffer 规划
 
 | Buffer 名称 | 用途 | 大小计算公式 |
 |------------|------|-------------|
@@ -321,7 +321,7 @@ GM workspace 按 AIC 和 ping-pong stage 划分，512B 对齐：
 | `vWorkspace` | `A@V` FP32 结果 | `align512(BT * BV * sizeof(float))` |
 | `aftermaskWorkspace` | gate/mask 后 A | `align512(BT * BT * sizeof(Q_T))` |
 
-### 分支场景覆盖
+#### 分支场景覆盖
 
 | 分支 | 条件 | 处理策略 |
 |------|------|---------|
@@ -333,7 +333,7 @@ GM workspace 按 AIC 和 ping-pong stage 划分，512B 对齐：
 | V 尾块 | `actBV < BV` | `SetTail` 和 `DataCopyPad` 控制有效列 |
 | varlen | `cu_seqlens.shape[0] > 2` | 使用 `cu_seqlens` 和 `chunk_indices` 计算 `bos/eos/i_t` |
 
-### TilingData 结构体
+#### TilingData 结构体
 
 ```cpp
 struct alignas(8) ChunkFwdOTilingData {
@@ -361,9 +361,9 @@ struct alignas(8) ChunkFwdOTilingData {
 };
 ```
 
-## 4.3 Kernel 方案
+### 4.3 Kernel 方案
 
-### 模板划分
+#### 模板划分
 
 | 模板 | 触发条件 | 模板参数 | 适用场景 |
 |-----|---------|---------|---------|
@@ -372,7 +372,7 @@ struct alignas(8) ChunkFwdOTilingData {
 
 TilingKey 由 host 侧设置：BF16 为 0，FP16 为 1。
 
-### API 映射
+#### API 映射
 
 | 计算步骤 | Ascend C API | 参数签名 | 约束说明 |
 |---------|-------------|---------|---------|
@@ -385,7 +385,7 @@ TilingKey 由 host 侧设置：BF16 为 0，FP16 为 1。
 | UB 到 GM | `DataCopy` / `DataCopyPad` | `GlobalTensor, LocalTensor, params` | 输出按有效 BT/BV 写回 |
 | 跨核同步 | `CrossCoreSetFlag/CrossCoreWaitFlag` | `MakeFlag(base, buf)` | 保护 ping-pong workspace 复用 |
 
-### 数据流
+#### 数据流
 
 ```text
 1. AIC: GM(q, k) -> Matmul(Q@K^T) -> GM(attnWs)
@@ -395,7 +395,7 @@ TilingKey 由 host 侧设置：BF16 为 0，FP16 为 1。
 5. AIV: GM(hWs, vWs, g) -> UB add/scale/cast -> GM(o)
 ```
 
-### 内存管理
+#### 内存管理
 
 | 内存区域 | 大小计算 | 说明 |
 |---------|---------|------|
@@ -404,9 +404,9 @@ TilingKey 由 host 侧设置：BF16 为 0，FP16 为 1。
 | 临时缓冲区 | `qhBuf_ + avBuf_ + amBuf_` | 存放 `Q@H`、`A@V`、mask 后 A |
 | Workspace | `numCubeCore * PING_PONG_STAGES * (hSlot + attnSlot + vSlot + amSlot)` | Cube/AIV 跨核传递中间结果 |
 
-# 五、测试策略
+## 五、测试策略
 
-## 5.1 测试参数说明
+### 5.1 测试参数说明
 
 业务 shape：
 
@@ -428,9 +428,9 @@ range 值域：
 * `g` 为 FP32，通常为非正累积衰减；异常值 `nan/inf/-inf` 不作为支持范围。
 * `scale` 需为有限 FP32，默认可取 `K ** -0.5`。
 
-## 5.2 测试脚本
+### 5.2 测试脚本
 
-### 5.2.1 CPU golden 实现
+#### 5.2.1 CPU golden 实现
 
 当前仓库未为该算子提供 CPU golden。无 NPU 自定义算子时，CI 侧验证
 Python 分发器：
@@ -445,7 +445,7 @@ Python 分发器：
 pytest -sv tests/ut/ops/test_chunk_fwd_o_ascendc.py::TestChunkFwdODispatcher
 ```
 
-### 5.2.2 NPU 小算子实现
+#### 5.2.2 NPU 小算子实现
 
 在 NPU 且自定义算子已注册时，运行数值对比：
 
