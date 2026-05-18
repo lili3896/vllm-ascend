@@ -46,8 +46,9 @@ struct alignas(8) ChunkFwdOTilingData {
     float   scale;                      // 注意力缩放，默认 1/sqrt(D)
     int64_t chunkSize;                  // BT，运行时 chunk 大小，当前要求 16 对齐且不超过 MAX_BT
     int64_t isVariedLen;                // 0=固定 shape，1=cu_seqlens 变长
-    int64_t totalChunks;                // NT：chunk_indices 的行数
-    int64_t numChunks;                  // 单 batch 的最大 chunk 数（h 的第 3 维）
+    int64_t tokenBatch;                 // cu_seqlens 描述的实际序列数；定长时等于 shapeBatch
+    int64_t totalChunks;                // chunk_indices 的行数；变长时为各 batch chunk 数之和
+    int64_t numChunks;                  // 单 batch 的 chunk 数（h 的第 3 维 / ceil(T, chunkSize)）
     int64_t vLoops;                     // ceil(V / BV)
     int64_t taskNum;                    // vLoops × shapeBatch × numChunks × vNumHead
     int64_t numCubeCore;                // 实际使用的 AIC 数（= blockDim）
@@ -60,6 +61,7 @@ struct alignas(8) ChunkFwdOTilingData {
     int64_t attnWorkspaceOffset;        // (Q @ K^T) 注意力分数 fp32
     int64_t vWorkspaceOffset;           // (A_masked @ V) 中间结果 fp32
     int64_t aftermaskWorkspaceOffset;   // 经 mask + g 衰减后的 A，dtype 与输入相同
+    int64_t maskWorkspaceOffset;        // 因果 mask workspace，预留 chunkSize × chunkSize 字节
 };
 #pragma pack(pop)
 

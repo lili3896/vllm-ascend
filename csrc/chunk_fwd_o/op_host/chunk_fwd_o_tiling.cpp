@@ -11,9 +11,11 @@
  * \file chunk_fwd_o_tiling.cpp
  * \brief ChunkFwdO 算子的 host tiling 实现。
  *
- *  - 任务划分：taskNum = vLoops × shapeBatch × numChunks × vNumHead。
+ *  - 任务划分：
+ *      定长：taskNum = vLoops × shapeBatch × numChunks × vNumHead；
+ *      变长：taskNum = vLoops × totalChunks × vNumHead。
  *  - 工作区按 numCubeCore × PING_PONG_STAGES 划分，单 buf 仅持有一个
- *    chunk 所需的中间数据（fp32 中间 + bf16 mask 结果）。
+ *    chunk 所需的中间数据（fp32 中间 + bf16/fp16 mask 结果）。
  */
 
 #include "register/op_def_registry.h"
@@ -153,6 +155,8 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
     }
 
     int64_t totalChunks = ciS.GetDimNum() >= 1 ? ciS.GetDim(0) : NT;
+    int64_t tokenBatch = cS.GetDimNum() >= 1 && cS.GetDim(0) > 0 ? cS.GetDim(0) - 1 : B;
+    int64_t isVariedLen = tokenBatch != B ? 1 : 0;
 
     tilingData_.set_shapeBatch(B);
     tilingData_.set_seqlen(T);
@@ -162,7 +166,8 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeShapes()
     tilingData_.set_vHeadDim(V);
     tilingData_.set_numChunks(NT);
     tilingData_.set_totalChunks(totalChunks);
-    tilingData_.set_isVariedLen(cS.GetDim(0) > 2 ? 1 : 0);
+    tilingData_.set_tokenBatch(tokenBatch);
+    tilingData_.set_isVariedLen(isVariedLen);
     tilingData_.set_hasG(context_->GetOptionalInputDesc(G_INDEX) != nullptr ? 1 : 0);
     return ge::GRAPH_SUCCESS;
 }
@@ -180,6 +185,15 @@ ge::graphStatus ChunkFwdOTiling::AnalyzeAttrs()
                 return ge::GRAPH_FAILED);
     tilingData_.set_scale(scale);
     tilingData_.set_chunkSize(cs);
+    int64_t chunksPerBatch = CeilDivT<int64_t>(tilingData_.get_seqlen(), cs);
+    int64_t fixedTotalChunks = tilingData_.get_shapeBatch() * chunksPerBatch;
+    bool useVarLenChunks = tilingData_.get_tokenBatch() != tilingData_.get_shapeBatch() ||
+                           tilingData_.get_totalChunks() != fixedTotalChunks;
+    tilingData_.set_isVariedLen(useVarLenChunks ? 1 : 0);
+    if (!useVarLenChunks) {
+        tilingData_.set_numChunks(chunksPerBatch);
+        tilingData_.set_totalChunks(fixedTotalChunks);
+    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -192,14 +206,9 @@ ge::graphStatus ChunkFwdOTiling::PlanCorePartition()
     int64_t BV  = std::min<int64_t>(DEFAULT_BV, V);
 
     int64_t vLoops  = CeilDivT<int64_t>(V, BV);
-    // taskNum = vLoops × shapeBatch × numChunks × vNumHead
-    int64_t taskNum = vLoops * B * NT * H;
-    // 当外部明确给出 totalChunks（来自 chunk_indices）时优先使用，确保
-    // 与 device 端 ComputeOffsets 中 NT 的语义一致。
     int64_t total = tilingData_.get_totalChunks();
-    if (total > 0 && total != B * NT) {
-        taskNum = vLoops * total * H;
-    }
+    int64_t taskChunks = (tilingData_.get_isVariedLen() != 0) ? total : B * NT;
+    int64_t taskNum = vLoops * taskChunks * H;
 
     int64_t aicNum = static_cast<int64_t>(compileInfo_.aicNum > 0 ? compileInfo_.aicNum : 1);
     int64_t aivNum = static_cast<int64_t>(compileInfo_.aivNum > 0 ? compileInfo_.aivNum : aicNum * 2);
@@ -219,15 +228,15 @@ ge::graphStatus ChunkFwdOTiling::PlanWorkspaces()
 {
     int64_t BT = tilingData_.get_chunkSize();
     int64_t V  = tilingData_.get_vHeadDim();
-    int64_t BV = std::min<int64_t>(DEFAULT_BV, V);
     int64_t dtSize = 2;  // bf16 / fp16
     int64_t aic = tilingData_.get_numCubeCore();
     int64_t stages = ChunkFwdO::PING_PONG_STAGES;
 
-    int64_t hSlot   = CeilAlignT<int64_t>(BT * BV * sizeof(float), WORKSPACE_ALIGN);
+    int64_t hSlot   = CeilAlignT<int64_t>(BT * V * sizeof(float), WORKSPACE_ALIGN);
     int64_t attnSlot = CeilAlignT<int64_t>(BT * BT * sizeof(float), WORKSPACE_ALIGN);
     int64_t vSlot   = hSlot;
     int64_t amSlot  = CeilAlignT<int64_t>(BT * BT * dtSize, WORKSPACE_ALIGN);
+    int64_t maskSlot = CeilAlignT<int64_t>(BT * BT, WORKSPACE_ALIGN);
 
     int64_t hPerAic    = stages * hSlot;
     int64_t attnPerAic = stages * attnSlot;
@@ -238,8 +247,9 @@ ge::graphStatus ChunkFwdOTiling::PlanWorkspaces()
     tilingData_.set_attnWorkspaceOffset(hPerAic * aic);
     tilingData_.set_vWorkspaceOffset(tilingData_.get_attnWorkspaceOffset() + attnPerAic * aic);
     tilingData_.set_aftermaskWorkspaceOffset(tilingData_.get_vWorkspaceOffset() + vPerAic * aic);
+    tilingData_.set_maskWorkspaceOffset(tilingData_.get_aftermaskWorkspaceOffset() + amPerAic * aic);
 
-    totalWorkspaceBytes_ = tilingData_.get_aftermaskWorkspaceOffset() + amPerAic * aic;
+    totalWorkspaceBytes_ = tilingData_.get_maskWorkspaceOffset() + maskSlot;
     return ge::GRAPH_SUCCESS;
 }
 
@@ -289,7 +299,8 @@ void ChunkFwdOTiling::PrintTilingData()
 {
     OP_LOGD(context_->GetNodeName(),
             "ChunkFwdO tiling: B=%ld T=%ld Hg=%ld H=%ld K=%ld V=%ld scale=%f BT=%ld "
-            "NT=%ld totalChunks=%ld vLoops=%ld taskNum=%ld AIC=%ld AIV=%ld dtype=%ld",
+            "varlen=%ld tokenBatch=%ld NT=%ld totalChunks=%ld vLoops=%ld taskNum=%ld "
+            "AIC=%ld AIV=%ld dtype=%ld ws[h=%ld attn=%ld v=%ld am=%ld mask=%ld]",
             tilingData_.get_shapeBatch(),
             tilingData_.get_seqlen(),
             tilingData_.get_kNumHead(),
@@ -298,13 +309,20 @@ void ChunkFwdOTiling::PrintTilingData()
             tilingData_.get_vHeadDim(),
             tilingData_.get_scale(),
             tilingData_.get_chunkSize(),
+            tilingData_.get_isVariedLen(),
+            tilingData_.get_tokenBatch(),
             tilingData_.get_numChunks(),
             tilingData_.get_totalChunks(),
             tilingData_.get_vLoops(),
             tilingData_.get_taskNum(),
             tilingData_.get_numCubeCore(),
             tilingData_.get_numVecCore(),
-            tilingData_.get_dataType());
+            tilingData_.get_dataType(),
+            tilingData_.get_hWorkspaceOffset(),
+            tilingData_.get_attnWorkspaceOffset(),
+            tilingData_.get_vWorkspaceOffset(),
+            tilingData_.get_aftermaskWorkspaceOffset(),
+            tilingData_.get_maskWorkspaceOffset());
 }
 
 static ge::graphStatus ChunkFwdOTilingFunc(gert::TilingContext* context)

@@ -31,7 +31,8 @@
  *      - 软件流水：每个主循环迭代同时启动新任务的 Phase A（Cube1+Vec1）
  *        与上一任务的 Phase B（Cube23+Vec2），不同 buf 互不冲突。
  *      - 任务划分：
- *          taskNum = vLoops × shapeBatch × numChunks × vNumHead
+ *          定长：taskNum = vLoops × shapeBatch × numChunks × vNumHead
+ *          变长：taskNum = vLoops × totalChunks × vNumHead
  *        AIC 用 GetBlockIdx() 取任务区间；AIV 用 GetBlockIdx() *
  *        GetSubBlockNum() + GetSubBlockIdx() 合并索引（成对的两个 AIV
  *        共享同一任务、按行拆分 BT）。
@@ -61,14 +62,16 @@ constexpr uint32_t BV_MAX      = CHUNK_FWD_O_BV;      // V 方向块大小上限
 constexpr uint32_t MASK_FP32   = 64;                  // 向量指令每次 mask 元素数
 constexpr int64_t WORKSPACE_ALIGN = 512;
 
-// CV 融合的跨核同步 flag。基地址 + buf_idx 区分 ping/pong。
-constexpr uint32_t FLAG_CUBE1_DONE_BASE  = 3;
-constexpr uint32_t FLAG_VEC1_DONE_BASE   = 5;
-constexpr uint32_t FLAG_CUBE23_DONE_BASE = 7;
-constexpr uint32_t FLAG_VEC2_DONE_BASE   = 9;
+// CV 融合的 5 个逻辑跨核同步 flag；buf_idx 只用于区分 ping/pong 物理槽位。
+constexpr uint32_t FLAG_CUBE1_DONE = 3;
+constexpr uint32_t FLAG_VEC1_DONE  = 4;
+constexpr uint32_t FLAG_CUBE2_DONE = 5;
+constexpr uint32_t FLAG_CUBE3_DONE = 6;
+constexpr uint32_t FLAG_VEC2_DONE  = 7;
+constexpr uint32_t CROSS_CORE_FLAG_COUNT = 5;
 
-__aicore__ inline uint32_t MakeFlag(uint32_t base, int64_t buf) {
-    return base + static_cast<uint32_t>(buf);
+__aicore__ inline uint32_t MakeFlag(uint32_t logicalFlag, int64_t buf) {
+    return logicalFlag + static_cast<uint32_t>(buf) * CROSS_CORE_FLAG_COUNT;
 }
 
 template <typename T>
@@ -108,37 +111,51 @@ __aicore__ inline void ComputeOffsetsFromTaskId(
     int64_t K      = td.kHeadDim;
     int64_t V      = td.vHeadDim;
     int64_t T      = td.seqlen;
-    int64_t NT     = td.totalChunks;
-    int64_t vLoops = td.vLoops;
+    int64_t B      = td.shapeBatch;
+    int64_t NT     = td.numChunks;
     int64_t BT     = td.chunkSize;
     int64_t BV     = (V < static_cast<int64_t>(BV_MAX)) ? V : static_cast<int64_t>(BV_MAX);
 
-    // 任务分解顺序：i_v 最内层，i_tg 中层，i_h 最外层
-    int64_t i_v  = taskId % vLoops;
-    int64_t rest = taskId / vLoops;
-    int64_t i_tg = rest % NT;        // 全局 chunk 行号（chunk_indices 行）
-    int64_t i_h  = rest / NT;
+    // 任务分解顺序与 host tiling 保持一致：
+    // fixed : taskId = (((vIdx * B + batch) * NT + chunk) * H + head)
+    // varlen: taskId = ((vIdx * totalChunks + globalChunk) * H + head)
+    int64_t taskPerV = (td.isVariedLen != 0) ? td.totalChunks * H : B * NT * H;
+    int64_t i_v = (taskPerV == 0) ? 0 : taskId / taskPerV;
+    int64_t rest = (taskPerV == 0) ? 0 : taskId % taskPerV;
+    int64_t i_n = 0;
+    int64_t i_t = 0;
+    int64_t i_h = 0;
+    if (td.isVariedLen != 0) {
+        int64_t i_tg = rest / H;
+        i_h = rest % H;
+        // chunk_indices[i_tg] = [i_n, i_t_in_seq]
+        i_n = chunkIndicesGm.GetValue(i_tg * 2);
+        i_t = chunkIndicesGm.GetValue(i_tg * 2 + 1);
+    } else {
+        int64_t tasksPerBatch = NT * H;
+        i_n = (tasksPerBatch == 0) ? 0 : rest / tasksPerBatch;
+        int64_t batchRest = (tasksPerBatch == 0) ? 0 : rest % tasksPerBatch;
+        i_t = (H == 0) ? 0 : batchRest / H;
+        i_h = (H == 0) ? 0 : batchRest % H;
+    }
 
-    // chunk_indices[i_tg] = [i_n, i_t_in_seq]
-    int64_t i_n = chunkIndicesGm.GetValue(i_tg * 2);
-    int64_t i_t = chunkIndicesGm.GetValue(i_tg * 2 + 1);
-
-    int64_t bos  = cuSeqlensGm.GetValue(i_n);
-    int64_t eos  = cuSeqlensGm.GetValue(i_n + 1);
+    int64_t bos = (td.isVariedLen != 0) ? cuSeqlensGm.GetValue(i_n) : i_n * T;
+    int64_t eos = (td.isVariedLen != 0) ? cuSeqlensGm.GetValue(i_n + 1) : bos + T;
     int64_t Tcur = eos - bos;
 
     int64_t i_hg = (Hg == H) ? i_h : (i_h / (H / Hg));
 
-    int64_t tokenOffset = bos + i_t * BT;
+    int64_t localTokenOffset = i_t * BT;
+    int64_t tokenOffset = bos + localTokenOffset;
     int64_t vStart = i_v * BV;
 
     // 各张量的元素偏移（详见文件头形状注释）。
     // q/k 对外是 [B,T,Hg,D]，这里按固定 head 跳步读取，等效搬入 [B,Hg,T,D]。
     off.qOffset = tokenOffset * Hg * K + i_hg * K;
     off.kOffset = off.qOffset;
-    off.vOffset = i_h * T * V + tokenOffset * V + vStart;
-    off.hOffset = i_h * NT * K * V + i_tg * K * V + vStart;
-    off.gOffset = i_h * T + tokenOffset;
+    off.vOffset = ((i_n * H + i_h) * T + localTokenOffset) * V + vStart;
+    off.hOffset = ((i_n * H + i_h) * NT + i_t) * K * V + vStart;
+    off.gOffset = (i_n * H + i_h) * T + localTokenOffset;
     // o 对外是 [B,T,H,D]，按 token-major 布局跳步写回，实现输出转置效果。
     off.oOffset = tokenOffset * H * V + i_h * V + vStart;
 
@@ -205,7 +222,7 @@ public:
      *   for currStage = 1..taskCount+1:
      *       Phase A on task (currStage-1)：Cube1 (Q@K^T) → SetFlag(cube1Done)
      *       Phase B on task (currStage-2)：WaitFlag(vec1Done) →
-     *                                     Cube2/Cube3 → SetFlag(cube23Done)
+     *                                     Cube2/Cube3 → SetFlag(cube2Done/cube3Done)
      *   两阶段使用不同 buf，可在 cube 上交错执行。
      */
     __aicore__ inline void Process()
@@ -224,8 +241,8 @@ public:
 
                 // buf 复用：等待两轮前同 buf 的 V1 与 V2 都已消费完毕。
                 if (taskNew >= static_cast<int64_t>(PING_PONG_STAGES)) {
-                    CrossCoreWaitFlag(MakeFlag(FLAG_VEC1_DONE_BASE, bufNew));
-                    CrossCoreWaitFlag(MakeFlag(FLAG_VEC2_DONE_BASE, bufNew));
+                    CrossCoreWaitFlag(MakeFlag(FLAG_VEC1_DONE, bufNew));
+                    CrossCoreWaitFlag(MakeFlag(FLAG_VEC2_DONE, bufNew));
                 }
 
                 if (offsets_[bufNew].valid) {
@@ -234,13 +251,13 @@ public:
                     mmQK.SetTail(offsets_[bufNew].actBT, offsets_[bufNew].actBT, td_->kHeadDim);
                     mmQK.IterateAll(attnWsGm_[bufNew], 0);
                 }
-                CrossCoreSetFlag<2, PIPE_FIX>(MakeFlag(FLAG_CUBE1_DONE_BASE, bufNew));
+                CrossCoreSetFlag<2, PIPE_FIX>(MakeFlag(FLAG_CUBE1_DONE, bufNew));
             }
 
             // ------ Phase B：Cube23 on task taskOld，写 hWs/vWs[bufOld] ------
             if (taskOld >= 0 && taskOld < taskCount) {
                 // 等 V1 把 amWs[bufOld] 写好
-                CrossCoreWaitFlag(MakeFlag(FLAG_VEC1_DONE_BASE, bufOld));
+                CrossCoreWaitFlag(MakeFlag(FLAG_VEC1_DONE, bufOld));
 
                 if (offsets_[bufOld].valid) {
                     // Cube2: Q @ H → hWs[bufOld]
@@ -248,14 +265,18 @@ public:
                     mmQH.SetTensorB(hGm_[offsets_[bufOld].hOffset], false);
                     mmQH.SetTail(offsets_[bufOld].actBT, offsets_[bufOld].actBV, td_->kHeadDim);
                     mmQH.IterateAll(hWsGm_[bufOld], 0);
+                    CrossCoreSetFlag<2, PIPE_FIX>(MakeFlag(FLAG_CUBE2_DONE, bufOld));
 
                     // Cube3: amWs[bufOld] @ V → vWs[bufOld]
                     mmAV.SetTensorA(amWsGm_[bufOld], false);
                     mmAV.SetTensorB(vGm_[offsets_[bufOld].vOffset], false);
                     mmAV.SetTail(offsets_[bufOld].actBT, offsets_[bufOld].actBV, offsets_[bufOld].actBT);
                     mmAV.IterateAll(vWsGm_[bufOld], 0);
+                    CrossCoreSetFlag<2, PIPE_FIX>(MakeFlag(FLAG_CUBE3_DONE, bufOld));
+                } else {
+                    CrossCoreSetFlag<2, PIPE_FIX>(MakeFlag(FLAG_CUBE2_DONE, bufOld));
+                    CrossCoreSetFlag<2, PIPE_FIX>(MakeFlag(FLAG_CUBE3_DONE, bufOld));
                 }
-                CrossCoreSetFlag<2, PIPE_FIX>(MakeFlag(FLAG_CUBE23_DONE_BASE, bufOld));
             }
         }
     }
@@ -265,9 +286,8 @@ private:
     {
         int64_t aicId       = GetBlockIdx();
         int64_t BT          = td_->chunkSize;
-        int64_t BV          = (td_->vHeadDim < static_cast<int64_t>(BV_MAX)) ?
-            td_->vHeadDim : static_cast<int64_t>(BV_MAX);
-        int64_t hSlotBytes  = AlignUp<int64_t>(BT * BV * sizeof(L0_T), WORKSPACE_ALIGN);
+        int64_t V           = td_->vHeadDim;
+        int64_t hSlotBytes  = AlignUp<int64_t>(BT * V * sizeof(L0_T), WORKSPACE_ALIGN);
         int64_t attnSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(L0_T), WORKSPACE_ALIGN);
         int64_t vSlotBytes  = hSlotBytes;
         int64_t amSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(Q_T), WORKSPACE_ALIGN);
@@ -381,23 +401,25 @@ public:
                     taskBegin_ + taskNew, *td_, cuSeqlensGm_, chunkIndicesGm_, offsets_[bufNew]);
 
                 if (taskNew >= static_cast<int64_t>(PING_PONG_STAGES)) {
-                    CrossCoreWaitFlag(MakeFlag(FLAG_CUBE23_DONE_BASE, bufNew));
+                    CrossCoreWaitFlag(MakeFlag(FLAG_CUBE2_DONE, bufNew));
+                    CrossCoreWaitFlag(MakeFlag(FLAG_CUBE3_DONE, bufNew));
                 }
-                CrossCoreWaitFlag(MakeFlag(FLAG_CUBE1_DONE_BASE, bufNew));
+                CrossCoreWaitFlag(MakeFlag(FLAG_CUBE1_DONE, bufNew));
 
                 if (offsets_[bufNew].valid) {
                     DoVec1(bufNew, offsets_[bufNew]);
                 }
-                CrossCoreSetFlag<2, PIPE_MTE3>(MakeFlag(FLAG_VEC1_DONE_BASE, bufNew));
+                CrossCoreSetFlag<2, PIPE_MTE3>(MakeFlag(FLAG_VEC1_DONE, bufNew));
             }
 
             // ------ Phase B：Vec2（fuse + cast + store）------
             if (taskOld >= 0 && taskOld < taskCount) {
-                CrossCoreWaitFlag(MakeFlag(FLAG_CUBE23_DONE_BASE, bufOld));
+                CrossCoreWaitFlag(MakeFlag(FLAG_CUBE2_DONE, bufOld));
+                CrossCoreWaitFlag(MakeFlag(FLAG_CUBE3_DONE, bufOld));
                 if (offsets_[bufOld].valid) {
                     DoVec2(bufOld, offsets_[bufOld]);
                 }
-                CrossCoreSetFlag<2, PIPE_MTE3>(MakeFlag(FLAG_VEC2_DONE_BASE, bufOld));
+                CrossCoreSetFlag<2, PIPE_MTE3>(MakeFlag(FLAG_VEC2_DONE, bufOld));
             }
         }
     }
@@ -407,9 +429,8 @@ private:
     {
         int64_t aicId       = GetBlockIdx();
         int64_t BT          = td_->chunkSize;
-        int64_t BV          = (td_->vHeadDim < static_cast<int64_t>(BV_MAX)) ?
-            td_->vHeadDim : static_cast<int64_t>(BV_MAX);
-        int64_t hSlotBytes  = AlignUp<int64_t>(BT * BV * sizeof(float), WORKSPACE_ALIGN);
+        int64_t V           = td_->vHeadDim;
+        int64_t hSlotBytes  = AlignUp<int64_t>(BT * V * sizeof(float), WORKSPACE_ALIGN);
         int64_t attnSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(float), WORKSPACE_ALIGN);
         int64_t vSlotBytes  = hSlotBytes;
         int64_t amSlotBytes = AlignUp<int64_t>(BT * BT * sizeof(Q_T), WORKSPACE_ALIGN);
@@ -429,6 +450,8 @@ private:
             amWsGm_[p].SetGlobalBuffer(reinterpret_cast<__gm__ Q_T*>(
                 workspace + td_->aftermaskWorkspaceOffset + aicId * amAicBytes + p * amSlotBytes));
         }
+        maskWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(
+            workspace + td_->maskWorkspaceOffset));
     }
 
     __aicore__ inline void BuildCausalMaskOnce()
@@ -582,6 +605,7 @@ private:
     GlobalTensor<float> attnWsGm_[PING_PONG_STAGES];
     GlobalTensor<float> vWsGm_[PING_PONG_STAGES];
     GlobalTensor<Q_T>   amWsGm_[PING_PONG_STAGES];
+    GlobalTensor<uint8_t> maskWsGm_;
     GlobalTensor<int64_t> cuSeqlensGm_, chunkIndicesGm_;
 
     GDNFwdOOffsets offsets_[PING_PONG_STAGES];
