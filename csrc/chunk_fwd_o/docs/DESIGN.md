@@ -262,7 +262,8 @@ kernel 入口 `chunk_fwd_o` 使用 `KERNEL_TYPE_MIX_AIC_1_2`。每个 block
 |------|--------|--------|------|
 | `CUBE1_DONE[buf]` | AIC | AIV | `Q@K^T` 已写入 `attnWs[buf]` |
 | `VEC1_DONE[buf]` | AIV | AIC | gate + mask 后 `A` 已写入 `amWs[buf]` |
-| `CUBE23_DONE[buf]` | AIC | AIV | `Q@H`、`A@V` 已写入 `hWs/vWs[buf]` |
+| `CUBE2_DONE[buf]` | AIC | AIV | `Q@H` 已写入 `hWs[buf]` |
+| `CUBE3_DONE[buf]` | AIC | AIV | `A@V` 已写入 `vWs[buf]` |
 | `VEC2_DONE[buf]` | AIV | AIC | 输出已写回，workspace 可复用 |
 
 ### 4.2 Tiling 方案
@@ -278,11 +279,15 @@ kernel 入口 `chunk_fwd_o` 使用 `KERNEL_TYPE_MIX_AIC_1_2`。每个 block
 `taskId` 解码逻辑：
 
 ```text
-i_v  = taskId % vLoops
-rest = taskId / vLoops
-i_tg = rest % totalChunks
-i_h  = rest / totalChunks
-chunk_indices[i_tg] = [i_n, i_t]
+tasksPerV = shapeBatch * numChunks * vNumHead
+vIdx = taskId / tasksPerV
+rest = taskId % tasksPerV
+shapeBatchIdx = rest / (numChunks * vNumHead)
+chunkIdx = (rest % (numChunks * vNumHead)) / vNumHead
+baseHeadIdx = rest % vNumHead
+
+// 变长时 tasksPerV = totalChunks * vNumHead，chunk_indices[globalChunk]
+// 反查 shapeBatchIdx/chunkIdx。
 ```
 
 其中 `i_hg = Hg == H ? i_h : i_h / (H / Hg)` 处理 GQA 头映射。
@@ -293,7 +298,7 @@ chunk_indices[i_tg] = [i_n, i_t]
 |------|------|
 | 单次处理数据量 | `BT = chunk_size` token（当前实现上限 64），`BV = min(128, V)` value 维 |
 | 是否分 chunk | 是，T 维按 `chunk_size` 切 chunk；V 维按 `BV = min(128, V)` 切块 |
-| chunk 大小计算公式 | `numChunks = h.shape[2]`，`totalChunks = chunk_indices.shape[0]`，`vLoops = ceil(V / BV)` |
+| chunk 大小计算公式 | 定长 `numChunks = ceil(T / chunkSize)`；变长 `totalChunks = chunk_indices.shape[0]`；`vLoops = ceil(V / BV)` |
 
 AIV 内按 `GetSubBlockIdx()` 将 `BT` 行均分给两个 AIV 子核：
 
@@ -319,10 +324,11 @@ GM workspace 按 AIC 和 ping-pong stage 划分，512B 对齐：
 
 | Workspace 段 | 用途 | 单槽大小 |
 |--------------|------|----------|
-| `hWorkspace` | `Q@H` FP32 结果 | `align512(BT * BV * sizeof(float))` |
+| `hWorkspace` | `Q@H` FP32 结果 | `align512(BT * V * sizeof(float))` |
 | `attnWorkspace` | `Q@K^T` FP32 结果 | `align512(BT * BT * sizeof(float))` |
-| `vWorkspace` | `A@V` FP32 结果 | `align512(BT * BV * sizeof(float))` |
+| `vWorkspace` | `A@V` FP32 结果 | `align512(BT * V * sizeof(float))` |
 | `aftermaskWorkspace` | gate/mask 后 A | `align512(BT * BT * sizeof(Q_T))` |
+| `maskWorkspace` | 因果 mask 预留区 | `align512(BT * BT)` |
 
 #### 分支场景覆盖
 
@@ -349,6 +355,7 @@ struct alignas(8) ChunkFwdOTilingData {
     float   scale;
     int64_t chunkSize;
     int64_t isVariedLen;
+    int64_t tokenBatch;
     int64_t totalChunks;
     int64_t numChunks;
     int64_t vLoops;
@@ -361,6 +368,7 @@ struct alignas(8) ChunkFwdOTilingData {
     int64_t attnWorkspaceOffset;
     int64_t vWorkspaceOffset;
     int64_t aftermaskWorkspaceOffset;
+    int64_t maskWorkspaceOffset;
 };
 ```
 

@@ -255,9 +255,9 @@ SetFlag(SYNC_AIV_TO_AIC_NEXT);
 | `scale`                           | attention 缩放系数                     |
 | `chunkSize`                       | `BT`（默认 64）                        |
 | `isVariedLen`                     | 0 = 固定长度，1 = 启用 cu_seqlens       |
-| `tokenBatch`                      | 总 token 数                             |
+| `tokenBatch`                      | `cu_seqlens` 描述的实际序列数；定长时等于 `shapeBatch` |
 | `dataType`                        | 0:BF16，1:FP16                          |
-| `totalChunks`、`bvNum`、`bkNum`   | 派生的 chunk/value/k 块计数             |
+| `numChunks` / `totalChunks`       | 单 batch chunk 数 / chunk 索引总行数    |
 | `numCubeCore`、`numVecCore`       | tiling 实际使用的核数                   |
 | `hasG`                            | 是否启用可选 gate                       |
 | `*WorkspaceOffset`                | workspace 内部各缓冲区的字节偏移        |
@@ -1201,8 +1201,9 @@ for (int64_t s = 1; s <= taskCount + 1; ++s) {
     // Phase A：Cube1 → SetFlag(CUBE1_DONE[bufNew])
     //          AIV 端 WaitFlag(CUBE1_DONE[bufNew]) → Vec1 → SetFlag(VEC1_DONE[bufNew])
 
-    // Phase B：AIC 端 WaitFlag(VEC1_DONE[bufOld]) → Cube2/Cube3 → SetFlag(CUBE23_DONE[bufOld])
-    //          AIV 端 WaitFlag(CUBE23_DONE[bufOld]) → Vec2 → SetFlag(VEC2_DONE[bufOld])
+    // Phase B：AIC 端 WaitFlag(VEC1_DONE[bufOld]) → Cube2/Cube3
+    //          → SetFlag(CUBE2_DONE[bufOld]/CUBE3_DONE[bufOld])
+    //          AIV 端 WaitFlag(CUBE2_DONE/CUBE3_DONE) → Vec2 → SetFlag(VEC2_DONE[bufOld])
 }
 ```
 
@@ -1213,7 +1214,8 @@ vLoops      = ceil(V / BV)
 shapeBatch  = B
 numChunks   = NT_per_batch  (h 张量的第 3 维)
 vNumHead    = H
-taskNum     = vLoops × shapeBatch × numChunks × vNumHead
+taskNum     = vLoops × shapeBatch × numChunks × vNumHead  (定长)
+taskNum     = vLoops × totalChunks × vNumHead             (变长)
 ```
 
 * **Cube 调度器（AIC）：** 直接用 `GetBlockIdx()` 取本核任务区间
@@ -1227,16 +1229,17 @@ taskNum     = vLoops × shapeBatch × numChunks × vNumHead
 
 ### 16.3 跨核同步标志
 
-实现使用 6 组 flag（每组 2 个，ping/pong 各一个）：
+实现使用 5 个逻辑 flag；物理 flag id 按 ping/pong stage 偏移，避免双缓冲复用冲突：
 
 | flag                  | 生产者 | 消费者 | 含义                                             |
 | --------------------- | ----- | ----- | ------------------------------------------------ |
 | `CUBE1_DONE[buf]`     | AIC   | AIV   | `Q@K^T` 已写入 `attnWs[buf]`                      |
 | `VEC1_DONE[buf]`      | AIV   | AIC   | `Apply G + Mask` 已写入 `amWs[buf]`，且 attnWs 可复用 |
-| `CUBE23_DONE[buf]`    | AIC   | AIV   | `Q@H` 写入 `hWs[buf]`，`Attn@V` 写入 `vWs[buf]`     |
+| `CUBE2_DONE[buf]`     | AIC   | AIV   | `Q@H` 已写入 `hWs[buf]`                            |
+| `CUBE3_DONE[buf]`     | AIC   | AIV   | `Attn@V` 已写入 `vWs[buf]`                         |
 | `VEC2_DONE[buf]`      | AIV   | AIC   | 融合输出 `O` 已写回，hWs / vWs 可复用             |
 
-`CUBE1_DONE / CUBE23_DONE` 使用 `PIPE_FIX` 触发；`VEC1_DONE / VEC2_DONE`
+`CUBE1_DONE / CUBE2_DONE / CUBE3_DONE` 使用 `PIPE_FIX` 触发；`VEC1_DONE / VEC2_DONE`
 使用 `PIPE_MTE3` 触发。`<2, ...>` 模板参数表示"两个配对 AIV 都置位
 后下游才放行"，避免漏掉子核的部分写入。
 
@@ -1259,7 +1262,7 @@ sequenceDiagram
     Cube->>Flag: WaitFlag(VEC1_DONE[0])
     Cube->>Cube: Cube2: Q×H → hWs[0]
     Cube->>Cube: Cube3: Attn×V → vWs[0]
-    Cube->>Flag: SetFlag(CUBE23_DONE[0])
+    Cube->>Flag: SetFlag(CUBE2_DONE[0] / CUBE3_DONE[0])
 
     Note over Cube, Vec: 与此同时：Phase A 在 buf=1 上进行
     Cube->>Cube: Cube1: Q×K^T → Attn[buf=1]
@@ -1268,8 +1271,8 @@ sequenceDiagram
     Vec->>Flag: SetFlag(VEC1_DONE[1])
 
     Note over Cube, Vec: Vec 拿到 Cube23 done 后做 Vec2
-    Flag-->>Vec: CUBE23_DONE[0] 置位
-    Vec->>Flag: WaitFlag(CUBE23_DONE[0])
+    Flag-->>Vec: CUBE2_DONE[0] / CUBE3_DONE[0] 置位
+    Vec->>Flag: WaitFlag(CUBE2_DONE[0] / CUBE3_DONE[0])
     Vec->>Vec: Vec2: 融合输出 O[0]
     Vec->>Flag: SetFlag(VEC2_DONE[0])
 
